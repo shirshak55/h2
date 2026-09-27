@@ -2,7 +2,7 @@ use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{HeaderOrder, Protocol};
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
@@ -269,6 +269,7 @@ where
         use http::Method;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let order = request.extensions_mut().remove::<HeaderOrder>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -318,7 +319,7 @@ where
 
         // Convert the message
         let headers =
-            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+            client::Peer::convert_send_message(stream_id, request, protocol, order, end_of_stream)?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
@@ -1286,6 +1287,7 @@ impl<B> StreamRef<B> {
         mut response: Response<()>,
         end_of_stream: bool,
     ) -> Result<(), UserError> {
+        let order = response.extensions_mut().remove::<HeaderOrder>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1297,7 +1299,8 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let frame =
+                server::Peer::convert_send_message(stream.id, response, order, end_of_stream);
 
             actions
                 .send

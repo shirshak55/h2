@@ -1,5 +1,5 @@
 use super::{util, StreamDependency, StreamId};
-use crate::ext::Protocol;
+use crate::ext::{HeaderOrder, Protocol};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 
@@ -8,6 +8,7 @@ use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
 use bytes::{Buf, BufMut, BytesMut};
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -86,10 +87,13 @@ pub struct Iter {
     fields: header::IntoIter<HeaderValue>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct HeaderBlock {
     /// The decoded header fields
     fields: HeaderMap,
+
+    /// The header fields' names in block order, as decoded or to encode them in
+    order: HeaderOrder,
 
     /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
@@ -101,6 +105,18 @@ struct HeaderBlock {
     /// headers frame.
     pseudo: Pseudo,
 }
+
+// Frames compare by their fields, as a `HeaderMap` does, whatever order they came in.
+impl PartialEq for HeaderBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+            && self.field_size == other.field_size
+            && self.is_over_size == other.is_over_size
+            && self.pseudo == other.pseudo
+    }
+}
+
+impl Eq for HeaderBlock {}
 
 #[derive(Debug)]
 struct EncodingHeaderBlock {
@@ -124,6 +140,7 @@ impl Headers {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
                 is_over_size: false,
                 pseudo,
             },
@@ -141,6 +158,7 @@ impl Headers {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
                 is_over_size: false,
                 pseudo: Pseudo::default(),
             },
@@ -205,6 +223,7 @@ impl Headers {
             stream_dep,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
+                order: HeaderOrder::default(),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -250,6 +269,16 @@ impl Headers {
 
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
         (self.header_block.pseudo, self.header_block.fields)
+    }
+
+    /// Takes the decoded header fields' names in block order.
+    pub(crate) fn take_header_order(&mut self) -> HeaderOrder {
+        std::mem::take(&mut self.header_block.order)
+    }
+
+    /// Encodes the header fields in `order`.
+    pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
+        self.header_block.order = order;
     }
 
     #[cfg(feature = "unstable")]
@@ -366,6 +395,7 @@ impl PushPromise {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
                 is_over_size: false,
                 pseudo,
             },
@@ -456,6 +486,7 @@ impl PushPromise {
             flags,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
+                order: HeaderOrder::default(),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -948,11 +979,13 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
+                            if let Err(_) = self.fields.try_append(name.clone(), value) {
                                 // HeaderMap capacity exceeded — treat as over-size
                                 // so the stream is rejected downstream (RST_STREAM / 431)
                                 // instead of panicking on the 24,577th unique header.
                                 self.is_over_size = true;
+                            } else {
+                                self.order.0.push(name);
                             }
                         }
                     }
@@ -992,10 +1025,25 @@ impl HeaderBlock {
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
         let mut hpack = encoder.take_scratch();
         hpack.clear();
+        // A `HeaderMap` can't hold repeats interleaved with other names, so fields in a
+        // recorded order are encoded from a list.
+        let (fields, ordered) = if self.order.0.is_empty() {
+            (self.fields, Vec::new())
+        } else {
+            let ordered = ordered_fields(&self.fields, &self.order.0);
+            (HeaderMap::new(), ordered)
+        };
+        let ordered = ordered
+            .into_iter()
+            .map(|(name, value)| hpack::Header::Field {
+                name: Some(name),
+                value,
+            });
         let headers = Iter {
             pseudo: Some(self.pseudo),
-            fields: self.fields.into_iter(),
-        };
+            fields: fields.into_iter(),
+        }
+        .chain(ordered);
 
         encoder.encode(headers, &mut hpack);
 
@@ -1027,6 +1075,31 @@ impl HeaderBlock {
             + pseudo_size!(path)
             + self.field_size
     }
+}
+
+/// `fields` in `order`, each listed name taking the next value of that name, then the
+/// values `order` doesn't list, in map order.
+fn ordered_fields(fields: &HeaderMap, order: &[HeaderName]) -> Vec<(HeaderName, HeaderValue)> {
+    let mut taken: HashMap<&HeaderName, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(fields.len());
+    for name in order {
+        let nth = taken.entry(name).or_default();
+        if let Some(value) = fields.get_all(name).iter().nth(*nth) {
+            out.push((name.clone(), value.clone()));
+            *nth += 1;
+        }
+    }
+    for name in fields.keys() {
+        let skip = taken.get(name).copied().unwrap_or_default();
+        out.extend(
+            fields
+                .get_all(name)
+                .iter()
+                .skip(skip)
+                .map(|value| (name.clone(), value.clone())),
+        );
+    }
+    out
 }
 
 fn calculate_headermap_size(map: &HeaderMap) -> usize {

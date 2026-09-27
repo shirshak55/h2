@@ -116,6 +116,7 @@
 //! [`TcpListener`]: https://docs.rs/tokio-core/0.1/tokio_core/net/struct.TcpListener.html
 
 use crate::codec::{Codec, UserError};
+use crate::ext::HeaderOrder;
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
@@ -1187,7 +1188,7 @@ impl<B: Buf> SendResponse<B> {
     /// - The response status code is not in the 1xx range
     /// - The final response has already been sent
     /// - There is a connection-level error
-    pub fn send_informational(&mut self, response: Response<()>) -> Result<(), crate::Error> {
+    pub fn send_informational(&mut self, mut response: Response<()>) -> Result<(), crate::Error> {
         let stream_id = self.inner.stream_id();
         let status = response.status();
 
@@ -1214,8 +1215,9 @@ impl<B: Buf> SendResponse<B> {
             stream_id
         );
 
+        let order = response.extensions_mut().remove::<HeaderOrder>();
         let frame = Peer::convert_send_message(
-            stream_id, response, false, // NOT end_of_stream for informational responses
+            stream_id, response, order, false, // NOT end_of_stream for informational responses
         );
 
         tracing::trace!(
@@ -1570,6 +1572,7 @@ impl Peer {
     pub fn convert_send_message(
         id: StreamId,
         response: Response<()>,
+        order: Option<HeaderOrder>,
         end_of_stream: bool,
     ) -> frame::Headers {
         use http::response::Parts;
@@ -1588,6 +1591,9 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut frame = frame::Headers::new(id, pseudo, headers);
+        if let Some(order) = order {
+            frame.set_header_order(order);
+        }
 
         if end_of_stream {
             frame.set_end_stream()

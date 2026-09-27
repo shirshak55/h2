@@ -3,6 +3,7 @@
 use crate::hpack::BytesStr;
 
 use bytes::Bytes;
+use http::HeaderName;
 use std::fmt;
 
 /// Represents the `:protocol` pseudo-header used by
@@ -53,3 +54,12 @@ impl fmt::Debug for Protocol {
         self.value.fmt(f)
     }
 }
+
+/// The names of a message's header fields in the order its header block carries them,
+/// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
+///
+/// h2 inserts one into each request and response it receives. A request or response
+/// sent with one is encoded in its order: each listed name takes the next value of that
+/// name, and values it doesn't list follow in map order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HeaderOrder(pub Vec<HeaderName>);

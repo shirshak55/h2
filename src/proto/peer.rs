@@ -1,4 +1,5 @@
 use crate::error::Reason;
+use crate::ext::HeaderOrder;
 use crate::frame::{Pseudo, StreamId};
 use crate::proto::{Error, Open};
 
@@ -61,14 +62,19 @@ impl Dyn {
         &self,
         pseudo: Pseudo,
         fields: HeaderMap,
+        order: HeaderOrder,
         stream_id: StreamId,
     ) -> Result<PollMessage, Error> {
         if self.is_server() {
-            crate::server::Peer::convert_poll_message(pseudo, fields, stream_id)
-                .map(PollMessage::Server)
+            crate::server::Peer::convert_poll_message(pseudo, fields, stream_id).map(|mut req| {
+                req.extensions_mut().insert(order);
+                PollMessage::Server(req)
+            })
         } else {
-            crate::client::Peer::convert_poll_message(pseudo, fields, stream_id)
-                .map(PollMessage::Client)
+            crate::client::Peer::convert_poll_message(pseudo, fields, stream_id).map(|mut res| {
+                res.extensions_mut().insert(order);
+                PollMessage::Client(res)
+            })
         }
     }
 

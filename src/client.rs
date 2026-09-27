@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{HeaderOrder, Protocol};
 use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
@@ -1637,6 +1637,7 @@ impl Peer {
         id: StreamId,
         request: Request<()>,
         protocol: Option<Protocol>,
+        order: Option<HeaderOrder>,
         end_of_stream: bool,
     ) -> Result<Headers, SendError> {
         use http::request::Parts;
@@ -1688,6 +1689,9 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut frame = Headers::new(id, pseudo, headers);
+        if let Some(order) = order {
+            frame.set_header_order(order);
+        }
 
         if end_of_stream {
             frame.set_end_stream()
