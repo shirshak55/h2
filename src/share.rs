@@ -1,4 +1,5 @@
 use crate::codec::UserError;
+use crate::ext::HeaderOrder;
 use crate::frame::Reason;
 use crate::proto::{self, WindowSize};
 
@@ -342,7 +343,19 @@ impl<B: Buf> SendStream<B> {
     /// Sending trailers implicitly closes the send stream. Once the send stream
     /// is closed, no more data can be sent.
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), crate::Error> {
-        self.inner.send_trailers(trailers).map_err(Into::into)
+        self.send_trailers_with_order(trailers, HeaderOrder::default())
+    }
+
+    /// Sends trailers to the remote peer with their fields in `order`, as a message
+    /// carrying a [`HeaderOrder`] is sent.
+    pub fn send_trailers_with_order(
+        &mut self,
+        trailers: HeaderMap,
+        order: HeaderOrder,
+    ) -> Result<(), crate::Error> {
+        self.inner
+            .send_trailers(trailers, order)
+            .map_err(Into::into)
     }
 
     /// Resets the stream.
@@ -428,8 +441,18 @@ impl RecvStream {
         &mut self,
         cx: &mut Context,
     ) -> Poll<Result<Option<HeaderMap>, crate::Error>> {
+        self.poll_trailers_with_order(cx)
+            .map_ok(|trailers| trailers.map(|(map, _)| map))
+    }
+
+    /// Polls for trailers and their fields' names in the order the trailer block carries
+    /// them, repeats included.
+    pub fn poll_trailers_with_order(
+        &mut self,
+        cx: &mut Context,
+    ) -> Poll<Result<Option<(HeaderMap, HeaderOrder)>, crate::Error>> {
         match ready!(self.inner.inner.poll_trailers(cx)) {
-            Some(Ok(map)) => Poll::Ready(Ok(Some(map))),
+            Some(Ok(trailers)) => Poll::Ready(Ok(Some(trailers))),
             Some(Err(e)) => Poll::Ready(Err(e.into())),
             None => Poll::Ready(Ok(None)),
         }

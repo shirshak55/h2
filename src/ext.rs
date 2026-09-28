@@ -60,6 +60,11 @@ impl fmt::Debug for Protocol {
 ///
 /// h2 inserts one into each request and response it receives. A request or response
 /// sent with one is encoded in its order: each listed name takes the next value of that
-/// name, and values it doesn't list follow in map order.
+/// name, and values it doesn't list follow in map order. Trailers carry theirs beside
+/// the map, through [`RecvStream::poll_trailers_with_order`] and
+/// [`SendStream::send_trailers_with_order`].
+///
+/// [`RecvStream::poll_trailers_with_order`]: crate::RecvStream::poll_trailers_with_order
+/// [`SendStream::send_trailers_with_order`]: crate::SendStream::send_trailers_with_order
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);

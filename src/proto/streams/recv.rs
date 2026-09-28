@@ -1,5 +1,6 @@
 use super::*;
 use crate::codec::UserError;
+use crate::ext::HeaderOrder;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
 
@@ -65,7 +66,7 @@ pub(super) struct Recv {
 pub(super) enum Event {
     Headers(peer::PollMessage),
     Data(DataEvent),
-    Trailers(HeaderMap),
+    Trailers(HeaderMap, HeaderOrder),
     InformationalHeaders(peer::PollMessage),
 }
 
@@ -419,7 +420,7 @@ impl Recv {
     /// Transition the stream based on receiving trailers
     pub fn recv_trailers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
         // Transition the state
@@ -430,12 +431,13 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        let order = frame.take_header_order();
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
         stream
             .pending_recv
-            .push_back(&mut self.buffer, Event::Trailers(trailers));
+            .push_back(&mut self.buffer, Event::Trailers(trailers, order));
         stream.notify_recv();
 
         Ok(())
@@ -1269,9 +1271,9 @@ impl Recv {
         &mut self,
         cx: &Context,
         stream: &mut Stream,
-    ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+    ) -> Poll<Option<Result<(HeaderMap, HeaderOrder), proto::Error>>> {
         match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
+            Some(Event::Trailers(trailers, order)) => Poll::Ready(Some(Ok((trailers, order)))),
             Some(event) => {
                 // Frame is not trailers.. not ready to poll trailers yet.
                 stream.pending_recv.push_front(&mut self.buffer, event);

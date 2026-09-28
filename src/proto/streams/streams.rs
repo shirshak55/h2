@@ -1201,7 +1201,11 @@ impl<B> StreamRef<B> {
         })
     }
 
-    pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
+    pub fn send_trailers(
+        &mut self,
+        trailers: HeaderMap,
+        order: HeaderOrder,
+    ) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1212,7 +1216,8 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the trailers frame
-            let frame = frame::Headers::trailers(stream.id, trailers);
+            let mut frame = frame::Headers::trailers(stream.id, trailers);
+            frame.set_header_order(order);
 
             // Send the trailers frame
             actions
@@ -1531,7 +1536,10 @@ impl OpaqueStreamRef {
             })
     }
 
-    pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+    pub fn poll_trailers(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Option<Result<(HeaderMap, HeaderOrder), proto::Error>>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
