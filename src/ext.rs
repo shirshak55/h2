@@ -86,6 +86,9 @@ struct FrameLogInner {
     frames: Vec<LoggedFrame>,
     limit: usize,
     dropped: usize,
+    /// Where every frame logged from now on goes, the limit aside (see
+    /// [`FrameLog::subscribe`]).
+    subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
 }
 
 impl FrameLog {
@@ -94,6 +97,7 @@ impl FrameLog {
             frames: Vec::new(),
             limit,
             dropped: 0,
+            subscribers: Vec::new(),
         })))
     }
 
@@ -103,6 +107,9 @@ impl FrameLog {
 
     pub(crate) fn push(&self, frame: LoggedFrame) {
         let mut inner = self.lock();
+        inner
+            .subscribers
+            .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
         if inner.frames.len() < inner.limit {
             inner.frames.push(frame);
         } else {
@@ -113,6 +120,18 @@ impl FrameLog {
     /// The frames logged so far, in the order received.
     pub fn frames(&self) -> Vec<LoggedFrame> {
         self.lock().frames.clone()
+    }
+
+    /// Every frame the log holds, in the order received, then each frame received from
+    /// now on as it arrives, past the log's limit too, until the connection ends.
+    pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut inner = self.lock();
+        for frame in &inner.frames {
+            let _ = sender.send(frame.clone());
+        }
+        inner.subscribers.push(sender);
+        receiver
     }
 
     /// How many frames arrived after the log reached its limit, and were not logged.
