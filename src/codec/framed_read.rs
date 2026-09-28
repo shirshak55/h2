@@ -1,3 +1,4 @@
+use crate::ext::{FrameLog, HeadersFrame, LoggedFrame};
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -33,6 +34,9 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+
+    /// Logs the peer's frames, when recording them.
+    frame_log: Option<FrameLog>,
 }
 
 /// Partially loaded headers frame
@@ -64,7 +68,14 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            frame_log: None,
         }
+    }
+
+    /// Logs every frame the peer sends but DATA to `log`, and attaches `log` to each
+    /// HEADERS frame.
+    pub fn set_frame_log(&mut self, log: FrameLog) {
+        self.frame_log = Some(log);
     }
 
     pub fn get_ref(&self) -> &T {
@@ -124,6 +135,7 @@ fn decode_frame(
     max_header_list_size: usize,
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
+    frame_log: Option<&FrameLog>,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
@@ -142,6 +154,23 @@ fn decode_frame(
     let kind = head.kind();
 
     tracing::trace!(frame.kind = ?kind);
+
+    // SETTINGS as sent, unknown identifiers included, which the frame drops.
+    let settings = match (frame_log, kind) {
+        (Some(_), Kind::Settings) => Some(LoggedFrame::Settings {
+            ack: head.flag() & 0x1 == 0x1,
+            params: bytes[frame::HEADER_LEN..]
+                .chunks_exact(6)
+                .map(|p| {
+                    (
+                        u16::from_be_bytes([p[0], p[1]]),
+                        u32::from_be_bytes([p[2], p[3], p[4], p[5]]),
+                    )
+                })
+                .collect(),
+        }),
+        _ => None,
+    };
 
     macro_rules! header_block {
         ($frame:ident, $head:ident, $bytes:ident) => ({
@@ -375,12 +404,72 @@ fn decode_frame(
             }
         }
         Kind::Unknown => {
+            if let Some(log) = frame_log {
+                log.push(LoggedFrame::Unknown {
+                    kind: bytes[3],
+                    flags: head.flag(),
+                    stream_id: head.stream_id().into(),
+                    length: (bytes.len() - frame::HEADER_LEN) as u32,
+                });
+            }
             // Unknown frames are ignored
             return Ok(None);
         }
     };
 
+    let mut frame = frame;
+    if let Some(log) = frame_log {
+        log_frame(log, &mut frame, settings);
+    }
+
     Ok(Some(frame))
+}
+
+/// Logs a decoded frame, and attaches the log to a HEADERS frame.
+fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
+    let logged = match frame {
+        Frame::Settings(_) => settings,
+        Frame::WindowUpdate(f) => Some(LoggedFrame::WindowUpdate {
+            stream_id: f.stream_id().into(),
+            increment: f.size_increment(),
+        }),
+        Frame::Priority(f) => Some(LoggedFrame::Priority {
+            stream_id: f.stream_id().into(),
+            priority: f.dependency().to_ext(),
+        }),
+        Frame::Headers(f) => {
+            let received = HeadersFrame {
+                stream_id: f.stream_id().into(),
+                priority: f.stream_dep().map(|dep| dep.to_ext()),
+                pseudo_order: f.pseudo_order().to_vec(),
+                connection: log.clone(),
+            };
+            let logged = LoggedFrame::Headers {
+                stream_id: received.stream_id,
+                end_stream: f.is_end_stream(),
+                priority: received.priority,
+                pseudo_order: received.pseudo_order.clone(),
+            };
+            f.set_received(received);
+            Some(logged)
+        }
+        Frame::Ping(f) => Some(LoggedFrame::Ping {
+            ack: f.is_ack(),
+            payload: *f.payload(),
+        }),
+        Frame::Reset(f) => Some(LoggedFrame::Reset {
+            stream_id: f.stream_id().into(),
+            error_code: f.reason().into(),
+        }),
+        Frame::GoAway(f) => Some(LoggedFrame::GoAway {
+            last_stream_id: f.last_stream_id().into(),
+            error_code: f.reason().into(),
+        }),
+        Frame::Data(_) | Frame::PushPromise(_) => None,
+    };
+    if let Some(logged) = logged {
+        log.push(logged);
+    }
 }
 
 impl<T> Stream for FramedRead<T>
@@ -406,6 +495,7 @@ where
                 max_header_list_size,
                 ref mut partial,
                 max_continuation_frames,
+                ref frame_log,
                 ..
             } = *self;
             if let Some(frame) = decode_frame(
@@ -413,6 +503,7 @@ where
                 max_header_list_size,
                 max_continuation_frames,
                 partial,
+                frame_log.as_ref(),
                 bytes,
             )? {
                 tracing::debug!(?frame, "received");

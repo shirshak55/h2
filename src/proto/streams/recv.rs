@@ -243,6 +243,7 @@ impl Recv {
 
         let stream_id = frame.stream_id();
         let order = frame.take_header_order();
+        let received = frame.take_received();
         let (pseudo, fields) = frame.into_parts();
 
         if pseudo.protocol.is_some()
@@ -259,9 +260,12 @@ impl Recv {
         }
 
         if !pseudo.is_informational() {
-            let message = counts
+            let mut message = counts
                 .peer()
                 .convert_poll_message(pseudo, fields, order, stream_id)?;
+            if let (peer::PollMessage::Server(req), Some(received)) = (&mut message, received) {
+                req.extensions_mut().insert(received);
+            }
 
             // Push the frame onto the stream's recv buffer
             stream

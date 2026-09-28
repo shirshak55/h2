@@ -1,5 +1,5 @@
 use super::{util, StreamDependency, StreamId};
-use crate::ext::{HeaderOrder, Protocol};
+use crate::ext::{HeaderOrder, HeadersFrame, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 
@@ -95,6 +95,12 @@ struct HeaderBlock {
     /// The header fields' names in block order, as decoded or to encode them in
     order: HeaderOrder,
 
+    /// The pseudo-header fields in block order, as decoded
+    pseudo_order: Vec<PseudoHeader>,
+
+    /// How the frame was received, for a connection recording its peer's frames
+    received: Option<Box<HeadersFrame>>,
+
     /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
 
@@ -141,6 +147,8 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                received: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -159,6 +167,8 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                received: None,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
             },
@@ -224,6 +234,8 @@ impl Headers {
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
                 order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                received: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -279,6 +291,24 @@ impl Headers {
     /// Encodes the header fields in `order`.
     pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
         self.header_block.order = order;
+    }
+
+    /// The decoded pseudo-header fields in block order.
+    pub(crate) fn pseudo_order(&self) -> &[PseudoHeader] {
+        &self.header_block.pseudo_order
+    }
+
+    pub(crate) fn stream_dep(&self) -> Option<&StreamDependency> {
+        self.stream_dep.as_ref()
+    }
+
+    /// Attaches how the frame was received, for the request it opens.
+    pub(crate) fn set_received(&mut self, received: HeadersFrame) {
+        self.header_block.received = Some(Box::new(received));
+    }
+
+    pub(crate) fn take_received(&mut self) -> Option<HeadersFrame> {
+        self.header_block.received.take().map(|received| *received)
     }
 
     #[cfg(feature = "unstable")]
@@ -396,6 +426,8 @@ impl PushPromise {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                received: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -487,6 +519,8 @@ impl PushPromise {
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
                 order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                received: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -920,7 +954,7 @@ impl HeaderBlock {
         }
 
         macro_rules! set_pseudo {
-            ($field:ident, $val:expr) => {{
+            ($field:ident, $id:ident, $val:expr) => {{
                 if reg {
                     tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
                     malformed = true;
@@ -936,6 +970,7 @@ impl HeaderBlock {
                     }
                     if !self.is_over_size {
                         self.pseudo.$field = Some(__val);
+                        self.pseudo_order.push(PseudoHeader::$id);
                     }
                 }
             }};
@@ -990,12 +1025,12 @@ impl HeaderBlock {
                         }
                     }
                 }
-                Authority(v) => set_pseudo!(authority, v),
-                Method(v) => set_pseudo!(method, v),
-                Scheme(v) => set_pseudo!(scheme, v),
-                Path(v) => set_pseudo!(path, v),
-                Protocol(v) => set_pseudo!(protocol, v),
-                Status(v) => set_pseudo!(status, v),
+                Authority(v) => set_pseudo!(authority, Authority, v),
+                Method(v) => set_pseudo!(method, Method, v),
+                Scheme(v) => set_pseudo!(scheme, Scheme, v),
+                Path(v) => set_pseudo!(path, Path, v),
+                Protocol(v) => set_pseudo!(protocol, Protocol, v),
+                Status(v) => set_pseudo!(status, Status, v),
             }
 
             ControlFlow::Continue(())

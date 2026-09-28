@@ -264,6 +264,9 @@ pub struct Builder {
     ///
     /// When this gets exhausted, we issue a GOAWAY with `ENHANCE_YOUR_CALM`.
     data_frame_budget: proto::DataFrameBudget,
+
+    /// How many of the client's frames to log per connection, when recording them.
+    frame_log_limit: Option<usize>,
 }
 
 /// Send a response back to the client
@@ -395,6 +398,10 @@ where
 
         if let Some(max) = builder.settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        if let Some(limit) = builder.frame_log_limit {
+            codec.set_frame_log(crate::ext::FrameLog::new(limit));
         }
 
         // Send initial settings frame.
@@ -663,7 +670,21 @@ impl Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
+            frame_log_limit: None,
         }
+    }
+
+    /// Records the frames each client sends that shape its HTTP/2 fingerprint.
+    ///
+    /// Each connection logs the client's frames but DATA, in the order received, up to
+    /// `limit` of them, in a [`FrameLog`](crate::ext::FrameLog), and each request carries a
+    /// [`HeadersFrame`](crate::ext::HeadersFrame) extension with its HEADERS frame's stream,
+    /// priority fields and pseudo-header order, and that log.
+    ///
+    /// Not recorded by default.
+    pub fn record_frames(&mut self, limit: usize) -> &mut Self {
+        self.frame_log_limit = Some(limit);
+        self
     }
 
     /// Indicates the initial window size (in octets) for stream-level
