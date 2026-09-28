@@ -189,6 +189,8 @@ pub enum LoggedFrame {
         stream_id: u32,
         /// The payload length.
         length: u32,
+        /// The payload.
+        payload: Bytes,
     },
 }
 

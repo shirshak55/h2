@@ -150,6 +150,64 @@ async fn serve_request() {
 }
 
 #[tokio::test]
+async fn record_frames_logs_unknown_frame_payload() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        // Unknown frame type 0x0b, len=3, flags=0x5, stream=1.
+        client
+            .send_bytes(&[0, 0, 3, 0x0b, 0x5, 0, 0, 0, 1, 0xaa, 0xbb, 0xcc])
+            .await;
+        client
+            .send_frame(
+                frames::headers(1)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut srv = server::Builder::new()
+            .record_frames(16)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        let headers = req.extensions().get::<ext::HeadersFrame>().unwrap();
+        let unknown = headers
+            .connection
+            .frames()
+            .into_iter()
+            .find(|frame| matches!(frame, ext::LoggedFrame::Unknown { .. }));
+        assert_eq!(
+            unknown,
+            Some(ext::LoggedFrame::Unknown {
+                kind: 0x0b,
+                flags: 0x5,
+                stream_id: 1,
+                length: 3,
+                payload: Bytes::from_static(&[0xaa, 0xbb, 0xcc]),
+            })
+        );
+
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
+
+        assert!(srv.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
 async fn serve_connect() {
     h2_support::trace_init!();
     let (io, mut client) = mock::new();

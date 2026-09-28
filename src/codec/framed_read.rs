@@ -9,7 +9,7 @@ use crate::hpack;
 
 use futures_core::Stream;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use std::io;
 
@@ -405,11 +405,13 @@ fn decode_frame(
         }
         Kind::Unknown => {
             if let Some(log) = frame_log {
+                let payload = Bytes::copy_from_slice(&bytes[frame::HEADER_LEN..]);
                 log.push(LoggedFrame::Unknown {
                     kind: bytes[3],
                     flags: head.flag(),
                     stream_id: head.stream_id().into(),
-                    length: (bytes.len() - frame::HEADER_LEN) as u32,
+                    length: payload.len() as u32,
+                    payload,
                 });
             }
             // Unknown frames are ignored
