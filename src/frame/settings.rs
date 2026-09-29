@@ -14,6 +14,8 @@ pub struct Settings {
     max_frame_size: Option<u32>,
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
+    /// The exact parameters to encode, when set by `set_wire`.
+    wire: Option<Vec<(u16, u32)>>,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -64,6 +66,29 @@ impl Settings {
 
     pub fn is_ack(&self) -> bool {
         self.flags.is_ack()
+    }
+
+    /// Encodes exactly `params`, `(identifier, value)` in order, unknown identifiers and
+    /// repeats included, and takes the known parameters' values from them, the last of a
+    /// repeated one winning, leaving the others unset.
+    pub fn set_wire(&mut self, params: Vec<(u16, u32)>) {
+        *self = Settings {
+            flags: self.flags,
+            ..Settings::default()
+        };
+        for &(id, value) in &params {
+            match id {
+                1 => self.header_table_size = Some(value),
+                2 => self.enable_push = Some(value),
+                3 => self.max_concurrent_streams = Some(value),
+                4 => self.initial_window_size = Some(value),
+                5 => self.max_frame_size = Some(value),
+                6 => self.max_header_list_size = Some(value),
+                8 => self.enable_connect_protocol = Some(value),
+                _ => {}
+            }
+        }
+        self.wire = Some(params);
     }
 
     pub fn initial_window_size(&self) -> Option<u32> {
@@ -205,6 +230,9 @@ impl Settings {
     }
 
     fn payload_len(&self) -> usize {
+        if let Some(wire) = &self.wire {
+            return wire.len() * 6;
+        }
         let mut len = 0;
         self.for_each(|_| len += 6);
         len
@@ -218,6 +246,14 @@ impl Settings {
         tracing::trace!("encoding SETTINGS; len={}", payload_len);
 
         head.encode(payload_len, dst);
+
+        if let Some(wire) = &self.wire {
+            for &(id, value) in wire {
+                dst.put_u16(id);
+                dst.put_u32(value);
+            }
+            return;
+        }
 
         // Encode the settings
         self.for_each(|setting| {

@@ -118,6 +118,25 @@ where
         }
     }
 
+    /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
+    /// (`window`, its increment) written ahead of every other frame: the remote may open
+    /// as many streams as it says, and the connection window grew by the increment.
+    pub fn apply_preface(
+        &mut self,
+        frame: &frame::Settings,
+        window: Option<WindowSize>,
+    ) -> Result<(), Reason> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if let Some(max) = frame.max_concurrent_streams() {
+            me.counts.set_max_recv_streams(max as usize);
+        }
+        match window {
+            Some(incr) => me.actions.recv.grow_connection_window(incr),
+            None => Ok(()),
+        }
+    }
+
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;

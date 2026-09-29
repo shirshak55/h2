@@ -25,6 +25,8 @@ pub struct FramedWrite<T, B> {
     inner: T,
     final_flush_done: bool,
 
+    hold: Hold,
+
     encoder: Encoder<B>,
 }
 
@@ -52,6 +54,15 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+}
+
+/// Whether writes are held back (see `FramedWrite::hold`), and the bytes to write ahead
+/// of the buffered frames once released.
+#[derive(Debug)]
+enum Hold {
+    Open,
+    Held,
+    Releasing(BytesMut),
 }
 
 #[derive(Debug)]
@@ -91,6 +102,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            hold: Hold::Open,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -138,6 +150,20 @@ where
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let span = tracing::trace_span!("FramedWrite::flush");
         let _e = span.enter();
+
+        match &mut self.hold {
+            Hold::Open => {}
+            Hold::Held => return Poll::Ready(Ok(())),
+            Hold::Releasing(front) => {
+                while front.has_remaining() {
+                    let n = ready!(poll_write_buf(Pin::new(&mut self.inner), cx, front))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                    }
+                }
+                self.hold = Hold::Open;
+            }
+        }
 
         loop {
             while !self.encoder.is_empty() {
@@ -327,6 +353,17 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    /// Holds every write back: frames buffer but nothing reaches the wire until
+    /// `release`.
+    pub fn hold(&mut self) {
+        self.hold = Hold::Held;
+    }
+
+    /// Ends a `hold`: `front` goes to the wire first, then the frames buffered meanwhile.
+    pub fn release(&mut self, front: BytesMut) {
+        self.hold = Hold::Releasing(front);
+    }
+
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
         self.encoder.max_frame_size()

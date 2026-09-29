@@ -125,6 +125,11 @@ impl Counts {
         }
     }
 
+    /// Sets how many streams the remote may open at once.
+    pub fn set_max_recv_streams(&mut self, max: usize) {
+        self.max_recv_streams = max;
+    }
+
     /// Returns true when the next opened stream will reach capacity of outbound streams
     ///
     /// The number of client send streams is incremented in prioritize; send_request has to guess if

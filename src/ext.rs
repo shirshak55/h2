@@ -258,3 +258,69 @@ pub struct HeadersFrame {
     /// The frames its connection's peer sent.
     pub connection: FrameLog,
 }
+
+/// A frame of a server's connection preface a [`DeferredPreface`] supplies: its SETTINGS,
+/// exactly as given, and the frames right after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrefaceFrame {
+    /// The SETTINGS frame: `(identifier, value)` in order, unknown identifiers and repeats
+    /// included. The known parameters set the connection's own settings.
+    Settings(Vec<(u16, u32)>),
+    /// A connection-level WINDOW_UPDATE, by its increment.
+    WindowUpdate(u32),
+    /// A frame of a type this crate doesn't know, sent as given.
+    Unknown {
+        /// The frame type.
+        kind: u8,
+        /// The flags.
+        flags: u8,
+        /// The stream identifier.
+        stream_id: u32,
+        /// The payload.
+        payload: Bytes,
+    },
+}
+
+/// A server connection's preface supplied once known (see
+/// [`server::Builder::deferred_preface`](crate::server::Builder::deferred_preface)): the
+/// connection reads the client's preface and frames meanwhile but sends nothing until the
+/// preface arrives on its [`PrefaceSender`], which it then writes ahead of everything
+/// else. A sender dropped without sending releases the connection with its own
+/// configured SETTINGS. Clones share the one preface, for a builder handed a preface to
+/// be cloned; the connection built from it takes it.
+#[derive(Clone, Debug)]
+pub struct DeferredPreface(Arc<Mutex<tokio::sync::oneshot::Receiver<Vec<PrefaceFrame>>>>);
+
+/// Supplies a [`DeferredPreface`].
+#[derive(Debug)]
+pub struct PrefaceSender(tokio::sync::oneshot::Sender<Vec<PrefaceFrame>>);
+
+/// A preface a connection waits for, and the sender supplying it.
+pub fn deferred_preface() -> (PrefaceSender, DeferredPreface) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    (
+        PrefaceSender(sender),
+        DeferredPreface(Arc::new(Mutex::new(receiver))),
+    )
+}
+
+impl PrefaceSender {
+    /// Sends `frames` as the connection's preface: its SETTINGS (the connection's own when
+    /// `frames` has none) and the frames right after it.
+    pub fn send(self, frames: Vec<PrefaceFrame>) {
+        let _ = self.0.send(frames);
+    }
+}
+
+impl DeferredPreface {
+    /// The frames to send, once supplied (none when the sender was dropped).
+    pub(crate) fn poll_frames(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Vec<PrefaceFrame>> {
+        let mut receiver = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        std::future::Future::poll(std::pin::Pin::new(&mut *receiver), cx)
+            .map(|frames| frames.unwrap_or_default())
+    }
+}

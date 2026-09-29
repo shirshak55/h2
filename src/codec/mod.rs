@@ -64,6 +64,17 @@ impl<T, B> Codec<T, B> {
         self.inner.set_frame_log(log)
     }
 
+    /// Holds every write back until `release`.
+    pub(crate) fn hold_writes(&mut self) {
+        self.framed_write().hold()
+    }
+
+    /// Ends `hold_writes`: `front` goes to the wire first, then the frames buffered
+    /// meanwhile.
+    pub(crate) fn release_writes(&mut self, front: bytes::BytesMut) {
+        self.framed_write().release(front)
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

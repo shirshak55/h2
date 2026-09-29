@@ -267,6 +267,9 @@ pub struct Builder {
 
     /// How many of the client's frames to log per connection, when recording them.
     frame_log_limit: Option<usize>,
+
+    /// The preface to send once supplied, instead of one at the handshake.
+    deferred_preface: Option<crate::ext::DeferredPreface>,
 }
 
 /// Send a response back to the client
@@ -404,14 +407,19 @@ where
             codec.set_frame_log(crate::ext::FrameLog::new(limit));
         }
 
-        // Send initial settings frame.
-        codec
-            .buffer(builder.settings.clone().into())
-            .expect("invalid SETTINGS frame");
-
-        // Create the handshake future.
-        let state =
-            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")));
+        // Send initial settings frame, unless it is deferred: then nothing goes out until
+        // the preface arrives.
+        let state = if builder.deferred_preface.is_some() {
+            codec.hold_writes();
+            Handshaking::ReadingPreface(
+                ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
+            )
+        } else {
+            codec
+                .buffer(builder.settings.clone().into())
+                .expect("invalid SETTINGS frame");
+            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")))
+        };
 
         drop(entered);
 
@@ -671,6 +679,7 @@ impl Builder {
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
             frame_log_limit: None,
+            deferred_preface: None,
         }
     }
 
@@ -684,6 +693,19 @@ impl Builder {
     /// Not recorded by default.
     pub fn record_frames(&mut self, limit: usize) -> &mut Self {
         self.frame_log_limit = Some(limit);
+        self
+    }
+
+    /// Sends the connection preface `preface` supplies instead of this builder's SETTINGS
+    /// at the handshake: the connection reads the client's preface and frames meanwhile,
+    /// and sends nothing (no SETTINGS, ACK, WINDOW_UPDATE or response) until the preface
+    /// arrives, which it then writes ahead of everything else. The connection window
+    /// then grows only by the preface's WINDOW_UPDATE, not
+    /// [`initial_connection_window_size`](Self::initial_connection_window_size).
+    ///
+    /// Lets a server reproduce another server's preface, once known.
+    pub fn deferred_preface(&mut self, preface: crate::ext::DeferredPreface) -> &mut Self {
+        self.deferred_preface = Some(preface);
         self
     }
 
@@ -1541,6 +1563,7 @@ where
                     let codec = ready!(Pin::new(read).poll(cx)?);
 
                     self.state = Handshaking::Done;
+                    let deferred = self.builder.deferred_preface.is_some();
 
                     let connection = proto::Connection::new(
                         codec,
@@ -1560,13 +1583,16 @@ where
                                 .builder
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
+                            deferred_preface: self.builder.deferred_preface.clone(),
                         },
                     );
 
                     tracing::trace!("connection established!");
                     let mut c = Connection { connection };
                     if let Some(sz) = self.builder.initial_target_connection_window_size {
-                        c.set_target_window_size(sz);
+                        if !deferred {
+                            c.set_target_window_size(sz);
+                        }
                     }
 
                     return Poll::Ready(Ok(c));

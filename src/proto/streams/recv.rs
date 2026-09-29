@@ -538,6 +538,13 @@ impl Recv {
     /// WINDOW_UPDATEs so the peer knows it has about `target` window to use
     /// for the whole connection.
     ///
+    /// Grows the connection window by `incr`, as a connection-level WINDOW_UPDATE of
+    /// `incr` already written does.
+    pub fn grow_connection_window(&mut self, incr: WindowSize) -> Result<(), Reason> {
+        self.flow.assign_capacity(incr)?;
+        self.flow.inc_window(incr)
+    }
+
     /// The `task` is an optional parked task for the `Connection` that might
     /// be blocked on needing more window capacity.
     pub fn set_target_connection_window(

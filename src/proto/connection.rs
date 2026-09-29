@@ -2,10 +2,11 @@ use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
 
+use crate::ext::{DeferredPreface, PrefaceFrame};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures_core::Stream;
 use std::io;
 use std::marker::PhantomData;
@@ -22,6 +23,10 @@ where
 {
     /// Read / write frame values
     codec: Codec<T, Prioritized<B>>,
+
+    /// The preface still to send, while writes wait for it (see
+    /// `server::Builder::deferred_preface`).
+    deferred_preface: Option<DeferredPreface>,
 
     inner: ConnectionInner<P, B>,
 }
@@ -84,6 +89,7 @@ pub(crate) struct Config {
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
+    pub deferred_preface: Option<DeferredPreface>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +158,7 @@ where
         span.follows_from(tracing::Span::current());
         Connection {
             codec,
+            deferred_preface: config.deferred_preface,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -293,6 +300,13 @@ where
         let span = tracing::trace_span!("poll");
         let _e = span.enter();
 
+        if let Some(deferred) = &mut self.deferred_preface {
+            if let Poll::Ready(frames) = deferred.poll_frames(cx) {
+                self.deferred_preface = None;
+                self.send_preface(frames)?;
+            }
+        }
+
         loop {
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
@@ -335,6 +349,57 @@ where
                 }
             }
         }
+    }
+
+    /// Writes a deferred preface: its SETTINGS (the configured one when `frames` has
+    /// none) and the frames after it, ahead of everything buffered meanwhile, and applies
+    /// the SETTINGS as this connection's own.
+    fn send_preface(&mut self, frames: Vec<PrefaceFrame>) -> Result<(), Error> {
+        let mut settings = self
+            .inner
+            .settings
+            .replace_pending_local(frame::Settings::default());
+        let mut front = BytesMut::new();
+        let mut window = None;
+        let mut sent_settings = false;
+        for frame in frames {
+            match frame {
+                PrefaceFrame::Settings(params) => {
+                    settings.set_wire(params);
+                    settings.encode(&mut front);
+                    sent_settings = true;
+                }
+                PrefaceFrame::WindowUpdate(incr) => {
+                    frame::WindowUpdate::new(StreamId::zero(), incr).encode(&mut front);
+                    window = Some(window.unwrap_or(0) + incr);
+                }
+                PrefaceFrame::Unknown {
+                    kind,
+                    flags,
+                    stream_id,
+                    payload,
+                } => {
+                    front.put_uint(payload.len() as u64, 3);
+                    front.put_u8(kind);
+                    front.put_u8(flags);
+                    front.put_u32(stream_id);
+                    front.put(payload);
+                }
+            }
+        }
+        if !sent_settings {
+            let mut first = BytesMut::new();
+            settings.encode(&mut first);
+            first.unsplit(front);
+            front = first;
+        }
+        self.inner
+            .streams
+            .apply_preface(&settings, window)
+            .map_err(Error::library_go_away)?;
+        self.inner.settings.replace_pending_local(settings);
+        self.codec.release_writes(front);
+        Ok(())
     }
 
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {

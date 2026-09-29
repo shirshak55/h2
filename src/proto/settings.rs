@@ -87,6 +87,15 @@ impl Settings {
         }
     }
 
+    /// The SETTINGS sent and awaiting its ACK, replaced by `frame`: the frame a deferred
+    /// preface sends instead of the configured one.
+    pub(crate) fn replace_pending_local(&mut self, frame: frame::Settings) -> frame::Settings {
+        match std::mem::replace(&mut self.local, Local::WaitingAck(frame)) {
+            Local::WaitingAck(local) | Local::ToSend(local) => local,
+            Local::Synced => frame::Settings::default(),
+        }
+    }
+
     pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
         assert!(!frame.is_ack());
         match &self.local {
