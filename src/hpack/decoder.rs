@@ -234,10 +234,13 @@ impl Decoder {
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let mut entry = self.decode_literal(src, false)?;
                     consume(src);
 
-                    // TODO: Track that this should never be indexed
+                    // An intermediary encodes it never indexed too (RFC 7541 §6.2.3).
+                    if let Header::Field { ref mut value, .. } = entry {
+                        value.set_sensitive(true);
+                    }
 
                     if f(entry).is_break() {
                         break;
