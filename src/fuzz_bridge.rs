@@ -10,7 +10,11 @@ pub mod fuzz_logic {
         let mut decoder_ = hpack::Decoder::new(0);
         let mut buf = BytesMut::new();
         buf.extend(data_);
-        let _dec_res = decoder_.decode(&mut Cursor::new(&mut buf), |_h| ControlFlow::Continue(()));
+        let _dec_res =
+            decoder_.decode(
+                &mut Cursor::new(&mut buf),
+                |_h, _| ControlFlow::Continue(()),
+            );
 
         if let Ok(s) = std::str::from_utf8(data_) {
             if let Ok(h) = http::Method::from_bytes(s.as_bytes()) {

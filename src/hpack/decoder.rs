@@ -173,14 +173,16 @@ impl Decoder {
         self.max_size_update = Some(size);
     }
 
-    /// Decodes the headers found in the given buffer.
+    /// Decodes the headers found in the given buffer, telling of each whether it came as
+    /// a never-indexed literal: a pseudo-header can't say so itself, as a field's
+    /// sensitive value does.
     pub fn decode<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
         mut f: F,
     ) -> Result<(), DecoderError>
     where
-        F: FnMut(Header) -> ControlFlow<()>,
+        F: FnMut(Header, bool) -> ControlFlow<()>,
     {
         use self::Representation::*;
 
@@ -205,7 +207,7 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_indexed(src)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, false).is_break() {
                         break;
                     }
                 }
@@ -218,7 +220,7 @@ impl Decoder {
                     self.table.insert(entry.clone());
                     consume(src);
 
-                    if f(entry).is_break() {
+                    if f(entry, false).is_break() {
                         break;
                     }
                 }
@@ -227,7 +229,7 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_literal(src, false)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, false).is_break() {
                         break;
                     }
                 }
@@ -242,7 +244,7 @@ impl Decoder {
                         value.set_sensitive(true);
                     }
 
-                    if f(entry).is_break() {
+                    if f(entry, true).is_break() {
                         break;
                     }
                 }
@@ -863,7 +865,7 @@ mod test {
     fn test_decode_empty() {
         let mut de = Decoder::new(0);
         let mut buf = BytesMut::new();
-        de.decode(&mut Cursor::new(&mut buf), |_| ControlFlow::Continue(()))
+        de.decode(&mut Cursor::new(&mut buf), |_, _| ControlFlow::Continue(()))
             .unwrap();
     }
 
@@ -878,7 +880,7 @@ mod test {
         buf.extend(huff_encode(b"bar"));
 
         let mut res = vec![];
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })
@@ -919,7 +921,7 @@ mod test {
 
         let mut res = vec![];
         let e = de
-            .decode(&mut Cursor::new(&mut buf), |h| {
+            .decode(&mut Cursor::new(&mut buf), |h, _| {
                 res.push(h);
                 ControlFlow::Continue(())
             })
@@ -929,7 +931,7 @@ mod test {
 
         // extend buf with the remaining header value
         buf.extend(&value[1..]);
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })

@@ -98,6 +98,9 @@ struct HeaderBlock {
     /// The pseudo-header fields in block order, as decoded
     pseudo_order: Vec<PseudoHeader>,
 
+    /// The pseudo-header fields decoded from never-indexed literals
+    never_indexed: Vec<PseudoHeader>,
+
     /// How the frame was received, for a connection recording its peer's frames
     received: Option<Box<HeadersFrame>>,
 
@@ -148,6 +151,7 @@ impl Headers {
                 fields,
                 order: HeaderOrder::default(),
                 pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
                 received: None,
                 is_over_size: false,
                 pseudo,
@@ -168,6 +172,7 @@ impl Headers {
                 fields,
                 order: HeaderOrder::default(),
                 pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
                 received: None,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -235,6 +240,7 @@ impl Headers {
                 fields: HeaderMap::new(),
                 order: HeaderOrder::default(),
                 pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
                 received: None,
                 field_size: 0,
                 is_over_size: false,
@@ -296,6 +302,11 @@ impl Headers {
     /// The decoded pseudo-header fields in block order.
     pub(crate) fn pseudo_order(&self) -> &[PseudoHeader] {
         &self.header_block.pseudo_order
+    }
+
+    /// The decoded pseudo-header fields that came as never-indexed literals.
+    pub(crate) fn never_indexed(&self) -> &[PseudoHeader] {
+        &self.header_block.never_indexed
     }
 
     pub(crate) fn stream_dep(&self) -> Option<&StreamDependency> {
@@ -427,6 +438,7 @@ impl PushPromise {
                 fields,
                 order: HeaderOrder::default(),
                 pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
                 received: None,
                 is_over_size: false,
                 pseudo,
@@ -520,6 +532,7 @@ impl PushPromise {
                 fields: HeaderMap::new(),
                 order: HeaderOrder::default(),
                 pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
                 received: None,
                 field_size: 0,
                 is_over_size: false,
@@ -954,7 +967,7 @@ impl HeaderBlock {
         }
 
         macro_rules! set_pseudo {
-            ($field:ident, $id:ident, $val:expr) => {{
+            ($field:ident, $id:ident, $val:expr, $never_indexed:expr) => {{
                 if reg {
                     tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
                     malformed = true;
@@ -971,6 +984,9 @@ impl HeaderBlock {
                     if !self.is_over_size {
                         self.pseudo.$field = Some(__val);
                         self.pseudo_order.push(PseudoHeader::$id);
+                        if $never_indexed {
+                            self.never_indexed.push(PseudoHeader::$id);
+                        }
                     }
                 }
             }};
@@ -982,7 +998,7 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode(&mut cursor, |header, never_indexed| {
             use crate::hpack::Header::*;
 
             match header {
@@ -1025,12 +1041,12 @@ impl HeaderBlock {
                         }
                     }
                 }
-                Authority(v) => set_pseudo!(authority, Authority, v),
-                Method(v) => set_pseudo!(method, Method, v),
-                Scheme(v) => set_pseudo!(scheme, Scheme, v),
-                Path(v) => set_pseudo!(path, Path, v),
-                Protocol(v) => set_pseudo!(protocol, Protocol, v),
-                Status(v) => set_pseudo!(status, Status, v),
+                Authority(v) => set_pseudo!(authority, Authority, v, never_indexed),
+                Method(v) => set_pseudo!(method, Method, v, never_indexed),
+                Scheme(v) => set_pseudo!(scheme, Scheme, v, never_indexed),
+                Path(v) => set_pseudo!(path, Path, v, never_indexed),
+                Protocol(v) => set_pseudo!(protocol, Protocol, v, never_indexed),
+                Status(v) => set_pseudo!(status, Status, v, never_indexed),
             }
 
             ControlFlow::Continue(())

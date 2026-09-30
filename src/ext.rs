@@ -255,6 +255,9 @@ pub struct HeadersFrame {
     pub priority: Option<StreamPriority>,
     /// Its pseudo-header fields, in block order.
     pub pseudo_order: Vec<PseudoHeader>,
+    /// Its pseudo-header fields sent as never-indexed literals, which an intermediary
+    /// sends so too (RFC 7541 §6.2.3); its fields' values are marked sensitive.
+    pub never_indexed: Vec<PseudoHeader>,
     /// The frames its connection's peer sent.
     pub connection: FrameLog,
 }

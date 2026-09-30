@@ -168,7 +168,7 @@ impl FuzzHpack {
 
             // Decode the chunk!
             decoder
-                .decode(&mut Cursor::new(&mut buf), |h| {
+                .decode(&mut Cursor::new(&mut buf), |h, _| {
                     let e = expect.remove(0);
                     assert_eq!(h, e);
                     ControlFlow::Continue(())

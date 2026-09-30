@@ -75,7 +75,7 @@ fn test_story(story: Value) {
             let mut buf = BytesMut::with_capacity(case.wire.len());
             buf.extend_from_slice(&case.wire);
             decoder
-                .decode(&mut Cursor::new(&mut buf), |e| {
+                .decode(&mut Cursor::new(&mut buf), |e, _| {
                     let (name, value) = expect.remove(0);
                     assert_eq!(name, key_str(&e));
                     assert_eq!(value, value_str(&e));
@@ -112,7 +112,7 @@ fn test_story(story: Value) {
             encoder.encode(input.clone(), &mut buf);
 
             decoder
-                .decode(&mut Cursor::new(&mut buf), |e| {
+                .decode(&mut Cursor::new(&mut buf), |e, _| {
                     assert_eq!(e, input.remove(0).reify().unwrap());
                     ControlFlow::Continue(())
                 })

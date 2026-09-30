@@ -444,6 +444,7 @@ fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
                 stream_id: f.stream_id().into(),
                 priority: f.stream_dep().map(|dep| dep.to_ext()),
                 pseudo_order: f.pseudo_order().to_vec(),
+                never_indexed: f.never_indexed().to_vec(),
                 connection: log.clone(),
             };
             let logged = LoggedFrame::Headers {
