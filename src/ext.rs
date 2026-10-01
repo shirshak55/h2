@@ -6,6 +6,7 @@ use bytes::Bytes;
 use http::HeaderName;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Waker};
 
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
@@ -315,6 +316,66 @@ impl PrefaceSender {
     /// `frames` has none) and the frames right after it.
     pub fn send(self, frames: Vec<PrefaceFrame>) {
         let _ = self.0.send(frames);
+    }
+}
+
+/// Ends a server connection as its caller relays another connection's end, from another
+/// task (see [`server::Builder::relayed_end`](crate::server::Builder::relayed_end)): with
+/// that connection's GOAWAYs, then its close. Clones share it.
+#[derive(Clone, Debug, Default)]
+pub struct RelayedEnd(Arc<Mutex<RelayedEndInner>>);
+
+#[derive(Debug, Default)]
+struct RelayedEndInner {
+    /// The GOAWAYs to send: their last stream id, error code and debug data.
+    go_aways: Vec<(u32, u32, Bytes)>,
+    close: bool,
+    task: Option<Waker>,
+}
+
+impl RelayedEnd {
+    /// An end nothing was relayed of yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sends a GOAWAY of `error_code` and `debug_data` naming `last_stream_id`, or, when
+    /// later, the last stream the connection accepted, as those are answered through the
+    /// relay, or, when earlier, the stream the GOAWAY it sent before named. The connection
+    /// then accepts no later stream, and stays open until [`Self::close`] or the client
+    /// closes it.
+    pub fn go_away(&self, last_stream_id: u32, error_code: u32, debug_data: Bytes) {
+        let mut inner = self.lock();
+        inner
+            .go_aways
+            .push((last_stream_id, error_code, debug_data));
+        inner.wake();
+    }
+
+    /// Closes the connection once it has no streams, with no GOAWAY of its own.
+    pub fn close(&self) {
+        let mut inner = self.lock();
+        inner.close = true;
+        inner.wake();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, RelayedEndInner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The GOAWAYs to send, and whether to close once idle; `cx` is woken when more come.
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> (Vec<(u32, u32, Bytes)>, bool) {
+        let mut inner = self.lock();
+        inner.task = Some(cx.waker().clone());
+        (std::mem::take(&mut inner.go_aways), inner.close)
+    }
+}
+
+impl RelayedEndInner {
+    fn wake(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.wake();
+        }
     }
 }
 

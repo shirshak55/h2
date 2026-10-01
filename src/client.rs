@@ -1369,6 +1369,7 @@ where
                     .resolve(builder.initial_target_connection_window_size),
                 deferred_preface: None,
                 leave_close_to_client: false,
+                relayed_end: None,
             },
         );
         let send_request = SendRequest {

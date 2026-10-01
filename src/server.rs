@@ -273,6 +273,9 @@ pub struct Builder {
 
     /// Whether a client's GOAWAY leaves closing the connection to the client.
     leave_close_to_client: bool,
+
+    /// The end of another connection to end the connection as.
+    relayed_end: Option<crate::ext::RelayedEnd>,
 }
 
 /// Send a response back to the client
@@ -684,6 +687,7 @@ impl Builder {
             frame_log_limit: None,
             deferred_preface: None,
             leave_close_to_client: false,
+            relayed_end: None,
         }
     }
 
@@ -721,6 +725,17 @@ impl Builder {
     /// relays to. By default the connection answers with its own GOAWAY and closes.
     pub fn leave_close_to_client(&mut self) -> &mut Self {
         self.leave_close_to_client = true;
+        self
+    }
+
+    /// Ends the connection as `end` relays another connection's end: it sends the GOAWAYs
+    /// `end` relays, then closes once it has no streams when `end` says so, with no GOAWAY
+    /// of its own (see [`RelayedEnd`](crate::ext::RelayedEnd)).
+    ///
+    /// Lets an intermediary end a client's connection as the server it relays to ended its
+    /// own.
+    pub fn relayed_end(&mut self, end: crate::ext::RelayedEnd) -> &mut Self {
+        self.relayed_end = Some(end);
         self
     }
 
@@ -1608,6 +1623,7 @@ where
                                 .resolve(self.builder.initial_target_connection_window_size),
                             deferred_preface: self.builder.deferred_preface.clone(),
                             leave_close_to_client: self.builder.leave_close_to_client,
+                            relayed_end: self.builder.relayed_end.clone(),
                         },
                     );
 

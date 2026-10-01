@@ -2,7 +2,7 @@ use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
 
-use crate::ext::{DeferredPreface, PrefaceFrame};
+use crate::ext::{DeferredPreface, PrefaceFrame, RelayedEnd};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
@@ -31,6 +31,11 @@ where
     /// Whether the peer's GOAWAY leaves closing to the peer (see
     /// `server::Builder::leave_close_to_client`).
     leave_close_to_client: bool,
+
+    /// The end of another connection it ends as (see `server::Builder::relayed_end`), and
+    /// whether that one closed.
+    relayed_end: Option<RelayedEnd>,
+    relayed_close: bool,
 
     inner: ConnectionInner<P, B>,
 }
@@ -95,6 +100,7 @@ pub(crate) struct Config {
     pub data_frame_budget: usize,
     pub deferred_preface: Option<DeferredPreface>,
     pub leave_close_to_client: bool,
+    pub relayed_end: Option<RelayedEnd>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +171,8 @@ where
             codec,
             deferred_preface: config.deferred_preface,
             leave_close_to_client: config.leave_close_to_client,
+            relayed_end: config.relayed_end,
+            relayed_close: false,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -313,6 +321,18 @@ where
             }
         }
 
+        if let Some(relayed) = &self.relayed_end {
+            let (go_aways, close) = relayed.poll_take(cx);
+            for (last_stream_id, error_code, debug_data) in go_aways {
+                self.inner.as_dyn().relay_go_away(
+                    last_stream_id.into(),
+                    error_code.into(),
+                    debug_data,
+                );
+            }
+            self.relayed_close = close;
+        }
+
         loop {
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
@@ -333,6 +353,15 @@ where
                                 && !self.inner.streams.has_streams()
                             {
                                 self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+                                continue;
+                            }
+
+                            if self.relayed_close
+                                && !self.inner.go_away.is_sending()
+                                && !self.inner.streams.has_streams()
+                            {
+                                self.inner.state =
+                                    State::Closing(Reason::NO_ERROR, Initiator::Library);
                                 continue;
                             }
 
@@ -430,10 +459,9 @@ where
                         return Poll::Ready(Err(Error::library_go_away(reason)));
                     }
                 }
-                // Only NO_ERROR should be waiting for idle
-                debug_assert_eq!(
-                    reason,
-                    Reason::NO_ERROR,
+                // Only NO_ERROR should be waiting for idle, but a relayed GOAWAY's
+                debug_assert!(
+                    reason == Reason::NO_ERROR || self.inner.go_away.is_relayed(),
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
@@ -497,6 +525,20 @@ where
         let frame = frame::GoAway::new(id, e);
         self.streams.send_go_away(id);
         self.go_away.go_away(frame);
+    }
+
+    /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`).
+    fn relay_go_away(&mut self, last_stream_id: StreamId, reason: Reason, debug_data: Bytes) {
+        let later = last_stream_id.max(self.streams.last_processed_id());
+        let last_stream_id = self.go_away.going_away().map_or(later, |going_away| {
+            later.min(going_away.last_processed_id())
+        });
+        self.streams.send_go_away(last_stream_id);
+        self.go_away.relay(frame::GoAway::with_debug_data(
+            last_stream_id,
+            reason,
+            debug_data,
+        ));
     }
 
     fn go_away_now(&mut self, e: Reason) {

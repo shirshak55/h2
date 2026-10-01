@@ -17,6 +17,9 @@ pub(super) struct GoAway {
     is_user_initiated: bool,
     /// A GOAWAY frame that must be buffered in the Codec immediately.
     pending: Option<frame::GoAway>,
+    /// Whether a GOAWAY relayed from another connection was sent, which leaves closing to
+    /// the relay.
+    relayed: bool,
 }
 
 /// Keeps a memory of any GOAWAY frames we've sent before.
@@ -44,6 +47,7 @@ impl GoAway {
             going_away: None,
             is_user_initiated: false,
             pending: None,
+            relayed: false,
         }
     }
 
@@ -80,6 +84,21 @@ impl GoAway {
         self.go_away(f);
     }
 
+    /// Enqueue `f`, a GOAWAY relayed from another connection: closing is left to the relay.
+    pub fn relay(&mut self, f: frame::GoAway) {
+        self.relayed = true;
+        self.go_away(f);
+    }
+
+    pub fn is_relayed(&self) -> bool {
+        self.relayed
+    }
+
+    /// Whether a GOAWAY frame waits to be buffered.
+    pub fn is_sending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub fn go_away_from_user(&mut self, f: frame::GoAway) {
         self.is_user_initiated = true;
         self.go_away_now(f);
@@ -107,6 +126,7 @@ impl GoAway {
     /// Returns if the connection should be closed when idle.
     pub fn should_close_on_idle(&self) -> bool {
         !self.close_now
+            && !self.relayed
             && self
                 .going_away
                 .as_ref()
@@ -150,5 +170,9 @@ impl GoAway {
 impl GoingAway {
     pub(crate) fn reason(&self) -> Reason {
         self.reason
+    }
+
+    pub(crate) fn last_processed_id(&self) -> StreamId {
+        self.last_processed_id
     }
 }
