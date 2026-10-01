@@ -1368,6 +1368,7 @@ where
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
                 deferred_preface: None,
+                leave_close_to_client: false,
             },
         );
         let send_request = SendRequest {

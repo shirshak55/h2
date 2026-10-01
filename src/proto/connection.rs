@@ -28,6 +28,10 @@ where
     /// `server::Builder::deferred_preface`).
     deferred_preface: Option<DeferredPreface>,
 
+    /// Whether the peer's GOAWAY leaves closing to the peer (see
+    /// `server::Builder::leave_close_to_client`).
+    leave_close_to_client: bool,
+
     inner: ConnectionInner<P, B>,
 }
 
@@ -90,6 +94,7 @@ pub(crate) struct Config {
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
     pub deferred_preface: Option<DeferredPreface>,
+    pub leave_close_to_client: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +164,7 @@ where
         Connection {
             codec,
             deferred_preface: config.deferred_preface,
+            leave_close_to_client: config.leave_close_to_client,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -322,7 +328,7 @@ where
                             // This will also handle flushing `self.codec`
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
-                            if (self.inner.error.is_some()
+                            if ((self.inner.error.is_some() && !self.leave_close_to_client)
                                 || self.inner.go_away.should_close_on_idle())
                                 && !self.inner.streams.has_streams()
                             {

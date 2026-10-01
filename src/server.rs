@@ -270,6 +270,9 @@ pub struct Builder {
 
     /// The preface to send once supplied, instead of one at the handshake.
     deferred_preface: Option<crate::ext::DeferredPreface>,
+
+    /// Whether a client's GOAWAY leaves closing the connection to the client.
+    leave_close_to_client: bool,
 }
 
 /// Send a response back to the client
@@ -680,6 +683,7 @@ impl Builder {
             data_frame_budget: proto::DataFrameBudget::Auto,
             frame_log_limit: None,
             deferred_preface: None,
+            leave_close_to_client: false,
         }
     }
 
@@ -706,6 +710,17 @@ impl Builder {
     /// Lets a server reproduce another server's preface, once known.
     pub fn deferred_preface(&mut self, preface: crate::ext::DeferredPreface) -> &mut Self {
         self.deferred_preface = Some(preface);
+        self
+    }
+
+    /// Leaves closing the connection to the client once it sent a GOAWAY: the connection
+    /// stays open, sending no GOAWAY of its own, after the client's streams are done, until
+    /// the client closes it.
+    ///
+    /// Lets an intermediary relaying the client's GOAWAY leave its answer to the server it
+    /// relays to. By default the connection answers with its own GOAWAY and closes.
+    pub fn leave_close_to_client(&mut self) -> &mut Self {
+        self.leave_close_to_client = true;
         self
     }
 
@@ -1592,6 +1607,7 @@ where
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
                             deferred_preface: self.builder.deferred_preface.clone(),
+                            leave_close_to_client: self.builder.leave_close_to_client,
                         },
                     );
 
