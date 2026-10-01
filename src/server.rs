@@ -1441,6 +1441,14 @@ impl<B: Buf> SendPushedResponse<B> {
         self.inner.poll_reset(cx)
     }
 
+    /// Polls until the frames sent on the pushed stream so far have all been handed to
+    /// the connection to write, so that a frame sent afterwards on another stream goes out
+    /// after them, or until they wait for the stream to be opened, which waits on other
+    /// streams closing (the client's `SETTINGS_MAX_CONCURRENT_STREAMS`).
+    pub fn poll_flushed(&mut self, cx: &mut Context) -> Poll<()> {
+        self.inner.inner.poll_flushed(cx)
+    }
+
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics

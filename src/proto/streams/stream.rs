@@ -51,6 +51,10 @@ pub(super) struct Stream {
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
 
+    /// Task waiting for the frames pending for this stream to be sent (see
+    /// `StreamRef::poll_flushed`).
+    flush_task: Option<Waker>,
+
     /// Frames pending for this stream being sent to the socket
     pub pending_send: buffer::Deque,
 
@@ -171,6 +175,7 @@ impl Stream {
             requested_send_capacity: 0,
             buffered_send_data: 0,
             send_task: None,
+            flush_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
             next_pending_send_capacity: None,
@@ -368,6 +373,17 @@ impl Stream {
 
     pub fn wait_send(&mut self, cx: &Context) {
         self.send_task = Some(cx.waker().clone());
+    }
+
+    /// Wakes the task waiting for this stream's pending frames to be sent.
+    pub fn notify_flushed(&mut self) {
+        if let Some(task) = self.flush_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_flushed(&mut self, cx: &Context) {
+        self.flush_task = Some(cx.waker().clone());
     }
 
     pub fn notify_recv(&mut self) {

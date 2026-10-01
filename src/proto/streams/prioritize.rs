@@ -672,6 +672,7 @@ impl Prioritize {
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
             tracing::trace!(?frame, "dropping");
         }
+        stream.notify_flushed();
 
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
@@ -851,6 +852,7 @@ impl Prioritize {
                                     self.pending_send.push(&mut pushed);
                                 } else {
                                     self.queue_open(&mut pushed);
+                                    pushed.notify_flushed();
                                 }
                             }
                             Frame::PushPromise(pp)
@@ -895,6 +897,9 @@ impl Prioritize {
                         // frame is a data frame and the stream does not have
                         // any more capacity.
                         self.pending_send.push(&mut stream);
+                    }
+                    if stream.pending_send.is_empty() {
+                        stream.notify_flushed();
                     }
 
                     counts.transition_after(stream, is_pending_reset);

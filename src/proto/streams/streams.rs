@@ -1455,6 +1455,23 @@ impl<B> StreamRef<B> {
         me.actions.send.poll_reset(cx, &mut stream, mode)
     }
 
+    /// Ready once the frames queued on the stream have all been handed to the connection
+    /// to write, so a frame queued afterwards on another stream goes out after them, or once
+    /// they wait for the stream to be opened, which waits on other streams closing.
+    pub fn poll_flushed(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        if stream.pending_send.is_empty()
+            || (stream.is_pending_open && !me.counts.can_inc_num_send_streams())
+        {
+            return Poll::Ready(());
+        }
+        stream.wait_flushed(cx);
+        Poll::Pending
+    }
+
     pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
         self.opaque.clone()
     }
