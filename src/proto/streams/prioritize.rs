@@ -684,6 +684,38 @@ impl Prioritize {
         }
     }
 
+    /// Like [`Self::clear_queue`], but keeps the stream's queued HEADERS frames,
+    /// in order.
+    pub fn clear_queue_but_headers<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+    ) {
+        let mut headers = Vec::new();
+        while let Some(frame) = stream.pending_send.pop_front(buffer) {
+            match frame {
+                Frame::Headers(_) => headers.push(frame),
+                frame => tracing::trace!(?frame, "dropping"),
+            }
+        }
+        let kept = !headers.is_empty();
+        for frame in headers {
+            stream.pending_send.push_back(buffer, frame);
+        }
+        if !kept {
+            stream.notify_flushed();
+        }
+
+        stream.buffered_send_data = 0;
+        stream.requested_send_capacity = 0;
+        if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
+            if stream.key() == key {
+                // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
+                self.in_flight_data_frame = InFlightData::Drop;
+            }
+        }
+    }
+
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
         while let Some(mut stream) = self.pending_send.pop(store) {
             let is_pending_reset = stream.is_pending_reset_expiration();

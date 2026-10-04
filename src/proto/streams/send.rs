@@ -259,13 +259,16 @@ impl Send {
         // Keep the queued HEADERS so the stream opens, then send the reset
         // immediately after.
         if !stream.is_pending_open {
-            // Otherwise, drop any buffered DATA/HEADERS and only send the
-            // reset.
+            // Otherwise, drop any buffered DATA and send the reset after the
+            // HEADERS still queued (a response's head, trailers): they aren't
+            // flow controlled, and as far as the caller knows they were sent, as
+            // the peer of a relay that reset its stream right after its head sent
+            // that head first.
             //
             // Note that we don't call `self.recv_err` because we want to enqueue
             // the reset frame before transitioning the stream inside
             // `reclaim_all_capacity`.
-            self.prioritize.clear_queue(buffer, stream);
+            self.prioritize.clear_queue_but_headers(buffer, stream);
         }
 
         let frame = frame::Reset::new(stream.id, reason);
