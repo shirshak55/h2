@@ -137,6 +137,26 @@ where
         }
     }
 
+    /// Grows the connection's receive window (`id` 0), or the client's stream `id`'s, by
+    /// `increment`, which a relayed WINDOW_UPDATE announces (see
+    /// [`RelayedFrame::WindowUpdate`](crate::ext::RelayedFrame::WindowUpdate)): the
+    /// stream's then grows only by those. Whether it did, so that the WINDOW_UPDATE goes
+    /// out.
+    pub fn relay_window_update(&mut self, id: StreamId, increment: WindowSize) -> bool {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if id.is_zero() {
+            return me.actions.recv.inc_connection_window(increment).is_ok();
+        }
+        match me.store.find_mut(&id) {
+            Some(mut stream) if !stream.state.is_closed() => {
+                stream.recv_flow.set_mirror();
+                stream.recv_flow.inc_recv_window(increment).is_ok()
+            }
+            _ => false,
+        }
+    }
+
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;

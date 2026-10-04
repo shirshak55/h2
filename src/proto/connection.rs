@@ -2,12 +2,14 @@ use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
 
-use crate::ext::{DeferredPreface, PrefaceFrame, RelayedEnd};
+use crate::ext::{DeferredPreface, PrefaceFrame, Relay, RelayedAck, RelayedEnd, RelayedFrame};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+use crate::proto::ping_pong::ReceivedPing;
 use crate::proto::*;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_core::Stream;
+use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -36,6 +38,11 @@ where
     /// whether that one closed.
     relayed_end: Option<RelayedEnd>,
     relayed_close: bool,
+
+    /// The frames relayed to the peer after the deferred preface (see `Relay`), and those
+    /// taken from it still to send.
+    relay: Option<Relay>,
+    relayed: VecDeque<RelayedFrame>,
 
     inner: ConnectionInner<P, B>,
 }
@@ -169,6 +176,8 @@ where
         span.follows_from(tracing::Span::current());
         Connection {
             codec,
+            relay: config.deferred_preface.as_ref().map(DeferredPreface::relay),
+            relayed: VecDeque::new(),
             deferred_preface: config.deferred_preface,
             leave_close_to_client: config.leave_close_to_client,
             relayed_end: config.relayed_end,
@@ -241,6 +250,63 @@ where
             .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
 
+        Poll::Ready(Ok(()))
+    }
+
+    /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
+    /// went out.
+    fn poll_relay(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let Some(relay) = &self.relay else {
+            return Poll::Ready(Ok(()));
+        };
+        if self.deferred_preface.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        self.relayed.extend(relay.poll_take(cx));
+        while !self.relayed.is_empty() {
+            ready!(self.codec.poll_ready(cx))?;
+            match self.relayed.pop_front().expect("a frame is relayed") {
+                RelayedFrame::Settings(params) => {
+                    let mut settings = frame::Settings::default();
+                    settings.set_wire(params);
+                    self.codec
+                        .buffer(settings.clone().into())
+                        .expect("invalid settings frame");
+                    self.inner.settings.sent_relayed(settings);
+                }
+                RelayedFrame::Ping(payload) => {
+                    self.codec
+                        .buffer(frame::Ping::new(payload).into())
+                        .expect("invalid ping frame");
+                    self.inner.ping_pong.sent_relayed(payload);
+                }
+                RelayedFrame::WindowUpdate {
+                    stream_id,
+                    increment,
+                } => {
+                    let stream_id = StreamId::from(stream_id);
+                    if self.inner.streams.relay_window_update(stream_id, increment) {
+                        self.codec
+                            .buffer(frame::WindowUpdate::new(stream_id, increment).into())
+                            .expect("invalid window update frame");
+                    }
+                }
+                RelayedFrame::Unknown {
+                    kind,
+                    flags,
+                    stream_id,
+                    payload,
+                } => {
+                    let mut frame = BytesMut::with_capacity(frame::HEADER_LEN + payload.len());
+                    frame.put_uint(payload.len() as u64, 3);
+                    frame.put_u8(kind);
+                    frame.put_u8(flags);
+                    frame.put_u32(stream_id);
+                    frame.put(payload);
+                    self.codec.buffer_raw(&frame);
+                }
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -466,6 +532,7 @@ where
                 );
             }
             ready!(self.poll_ready(cx))?;
+            ready!(self.poll_relay(cx))?;
 
             match self
                 .inner
@@ -473,12 +540,15 @@ where
                 .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
             {
                 ReceivedFrame::Settings(frame) => {
-                    self.inner.settings.recv_settings(
+                    if self.inner.settings.recv_settings(
                         frame,
                         &mut self.codec,
                         &mut self.inner.streams,
-                    )?;
+                    )? {
+                        self.relay_acked(RelayedAck::Settings);
+                    }
                 }
+                ReceivedFrame::RelayedAck(ack) => self.relay_acked(ack),
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
                     return Poll::Ready(Ok(()));
@@ -489,6 +559,12 @@ where
 
     fn clear_expired_reset_streams(&mut self) {
         self.inner.streams.clear_expired_reset_streams();
+    }
+
+    fn relay_acked(&self, ack: RelayedAck) {
+        if let Some(relay) = &self.relay {
+            relay.acked(ack);
+        }
     }
 }
 
@@ -684,15 +760,20 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
-                let status = self.ping_pong.recv_ping(frame);
-                if status.is_shutdown() {
-                    assert!(
-                        self.go_away.is_going_away(),
-                        "received unexpected shutdown ping"
-                    );
+                match self.ping_pong.recv_ping(frame) {
+                    ReceivedPing::Shutdown => {
+                        assert!(
+                            self.go_away.is_going_away(),
+                            "received unexpected shutdown ping"
+                        );
 
-                    let last_processed_id = self.streams.last_processed_id();
-                    self.go_away(last_processed_id, Reason::NO_ERROR);
+                        let last_processed_id = self.streams.last_processed_id();
+                        self.go_away(last_processed_id, Reason::NO_ERROR);
+                    }
+                    ReceivedPing::Relayed(payload) => {
+                        return Ok(ReceivedFrame::RelayedAck(RelayedAck::Ping(payload)));
+                    }
+                    ReceivedPing::MustAck | ReceivedPing::Unknown => {}
                 }
             }
             Some(WindowUpdate(frame)) => {
@@ -715,6 +796,8 @@ where
 
 enum ReceivedFrame {
     Settings(frame::Settings),
+    /// The peer's ACK of a relayed frame.
+    RelayedAck(RelayedAck),
     Continue,
     Done,
 }
@@ -772,6 +855,9 @@ where
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
+        if let Some(relay) = &self.relay {
+            relay.close();
+        }
     }
 }
 

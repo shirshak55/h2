@@ -146,6 +146,12 @@ where
         self.encoder.buffer(item)
     }
 
+    /// Buffers `frame`, a whole encoded frame, as is.
+    pub fn buffer_raw(&mut self, frame: &[u8]) {
+        assert!(self.encoder.has_capacity());
+        self.encoder.buf.get_mut().put_slice(frame);
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let span = tracing::trace_span!("FramedWrite::flush");

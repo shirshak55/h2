@@ -16,6 +16,8 @@ pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
     pending_pong: Option<PingPayload>,
     user_pings: Option<UserPingsRx>,
+    /// The payloads of the relayed PINGs sent (see `Relay`) awaiting their ACKs.
+    relayed: Vec<PingPayload>,
 }
 
 #[derive(Debug)]
@@ -45,6 +47,8 @@ pub(crate) enum ReceivedPing {
     MustAck,
     Unknown,
     Shutdown,
+    /// The ACK of a relayed PING carrying this payload.
+    Relayed(PingPayload),
 }
 
 /// No user ping pending.
@@ -66,7 +70,13 @@ impl PingPong {
             pending_ping: None,
             pending_pong: None,
             user_pings: None,
+            relayed: Vec::new(),
         }
+    }
+
+    /// Notes a relayed PING carrying `payload` just sent, which awaits its ACK.
+    pub(crate) fn sent_relayed(&mut self, payload: PingPayload) {
+        self.relayed.push(payload);
     }
 
     /// Can only be called once. If called a second time, returns `None`.
@@ -120,6 +130,10 @@ impl PingPong {
                     tracing::trace!("recv PING USER ack");
                     return ReceivedPing::Unknown;
                 }
+            }
+
+            if let Some(index) = self.relayed.iter().position(|sent| sent == ping.payload()) {
+                return ReceivedPing::Relayed(self.relayed.remove(index));
             }
 
             // else we were acked a ping we didn't send?
@@ -195,12 +209,6 @@ impl PingPong {
         }
 
         Poll::Ready(Ok(()))
-    }
-}
-
-impl ReceivedPing {
-    pub(crate) fn is_shutdown(&self) -> bool {
-        matches!(*self, Self::Shutdown)
     }
 }
 

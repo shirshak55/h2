@@ -46,6 +46,10 @@ pub struct FlowControl {
     /// This can go negative if a user declares a smaller target window than
     /// the peer knows about.
     available: Window,
+
+    /// Whether the window grows only by the relayed WINDOW_UPDATEs of the peer the data
+    /// received is relayed to (see [`Self::set_mirror`]).
+    mirror: bool,
 }
 
 impl FlowControl {
@@ -53,7 +57,33 @@ impl FlowControl {
         FlowControl {
             window_size: Window(0),
             available: Window(0),
+            mirror: false,
         }
+    }
+
+    /// Makes the window grow only by a relayed peer's WINDOW_UPDATEs,
+    /// [`Self::inc_recv_window`]'s, rather than by the data released, which then assigns
+    /// no capacity.
+    pub fn set_mirror(&mut self) {
+        self.mirror = true;
+    }
+
+    /// Whether the window grows only by a relayed peer's WINDOW_UPDATEs (see
+    /// [`Self::set_mirror`]).
+    pub fn is_mirror(&self) -> bool {
+        self.mirror
+    }
+
+    /// Grows the receive window by `sz`, which a WINDOW_UPDATE of our own announces,
+    /// leaving the unclaimed capacity as is.
+    pub fn inc_recv_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        if sz == 0 {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+        let available = self.available.add(sz)?;
+        self.inc_window(sz)?;
+        self.available = available;
+        Ok(())
     }
 
     /// Returns the window size as known by the peer
@@ -98,6 +128,9 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
+        if self.mirror {
+            return None;
+        }
         let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
 
         if unclaimed < threshold {

@@ -483,6 +483,13 @@ impl Recv {
             return Err(UserError::ReleaseCapacityTooBig);
         }
 
+        if stream.recv_flow.is_mirror() {
+            // The relayed peer's WINDOW_UPDATEs grow the windows instead.
+            self.in_flight_data -= capacity;
+            stream.in_flight_recv_data -= capacity;
+            return Ok(());
+        }
+
         self.release_connection_capacity(capacity, task);
 
         // Decrement in-flight data
@@ -526,6 +533,12 @@ impl Recv {
         }
 
         self.clear_recv_buffer(stream, task, counts);
+    }
+
+    /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
+    /// own announces, leaving the unclaimed capacity as is.
+    pub fn inc_connection_window(&mut self, increment: WindowSize) -> Result<(), Reason> {
+        self.flow.inc_recv_window(increment)
     }
 
     /// Set the "target" connection window size.

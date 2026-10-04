@@ -4,6 +4,7 @@ use crate::hpack::BytesStr;
 
 use bytes::Bytes;
 use http::HeaderName;
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
@@ -90,6 +91,17 @@ struct FrameLogInner {
     /// Where every frame logged from now on goes, the limit aside (see
     /// [`FrameLog::subscribe`]).
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
+    /// Called with every frame logged from now on (see [`FrameLog::on_frame`]).
+    hooks: Vec<FrameHook>,
+}
+
+#[derive(Clone)]
+struct FrameHook(Arc<dyn Fn(&LoggedFrame) + Send + Sync>);
+
+impl fmt::Debug for FrameHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("FrameHook(..)")
+    }
 }
 
 impl FrameLog {
@@ -99,6 +111,7 @@ impl FrameLog {
             limit,
             dropped: 0,
             subscribers: Vec::new(),
+            hooks: Vec::new(),
         })))
     }
 
@@ -111,10 +124,15 @@ impl FrameLog {
         inner
             .subscribers
             .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
+        let hooks = inner.hooks.clone();
         if inner.frames.len() < inner.limit {
-            inner.frames.push(frame);
+            inner.frames.push(frame.clone());
         } else {
             inner.dropped += 1;
+        }
+        drop(inner);
+        for hook in hooks {
+            (hook.0)(&frame);
         }
     }
 
@@ -138,6 +156,13 @@ impl FrameLog {
     /// How many frames arrived after the log reached its limit, and were not logged.
     pub fn dropped(&self) -> usize {
         self.lock().dropped
+    }
+
+    /// Calls `hook` with each frame received from now on as it arrives, past the log's
+    /// limit too: after the subscribers got it (see [`Self::subscribe`]), and before the
+    /// connection acts on it.
+    pub fn on_frame(&self, hook: impl Fn(&LoggedFrame) + Send + Sync + 'static) {
+        self.lock().hooks.push(FrameHook(Arc::new(hook)));
     }
 }
 
@@ -292,11 +317,14 @@ pub enum PrefaceFrame {
 /// [`server::Builder::deferred_preface`](crate::server::Builder::deferred_preface)): the
 /// connection reads the client's preface and frames meanwhile but sends nothing until the
 /// preface arrives on its [`PrefaceSender`], which it then writes ahead of everything
-/// else. A sender dropped without sending releases the connection with its own
-/// configured SETTINGS. Clones share the one preface, for a builder handed a preface to
-/// be cloned; the connection built from it takes it.
+/// else, then the frames its [`Relay`] relays. A sender dropped without sending releases
+/// the connection with its own configured SETTINGS. Clones share the one preface, for a
+/// builder handed a preface to be cloned; the connection built from it takes it.
 #[derive(Clone, Debug)]
-pub struct DeferredPreface(Arc<Mutex<tokio::sync::oneshot::Receiver<Vec<PrefaceFrame>>>>);
+pub struct DeferredPreface {
+    preface: Arc<Mutex<tokio::sync::oneshot::Receiver<Vec<PrefaceFrame>>>>,
+    relay: Relay,
+}
 
 /// Supplies a [`DeferredPreface`].
 #[derive(Debug)]
@@ -307,7 +335,10 @@ pub fn deferred_preface() -> (PrefaceSender, DeferredPreface) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     (
         PrefaceSender(sender),
-        DeferredPreface(Arc::new(Mutex::new(receiver))),
+        DeferredPreface {
+            preface: Arc::new(Mutex::new(receiver)),
+            relay: Relay::default(),
+        },
     )
 }
 
@@ -380,13 +411,135 @@ impl RelayedEndInner {
 }
 
 impl DeferredPreface {
+    /// Relays frames on the connection taking this preface, after it (see [`Relay`]).
+    pub fn relay(&self) -> Relay {
+        self.relay.clone()
+    }
+
     /// The frames to send, once supplied (none when the sender was dropped).
     pub(crate) fn poll_frames(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Vec<PrefaceFrame>> {
-        let mut receiver = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut receiver = self.preface.lock().unwrap_or_else(PoisonError::into_inner);
         std::future::Future::poll(std::pin::Pin::new(&mut *receiver), cx)
             .map(|frames| frames.unwrap_or_default())
+    }
+}
+
+/// A frame another connection's peer sent, which a server connection relays to its client
+/// (see [`Relay`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayedFrame {
+    /// A SETTINGS frame: `(identifier, value)` in order, unknown identifiers and repeats
+    /// included, whatever SETTINGS sent before await acknowledgement. The known parameters
+    /// apply to the connection as its own once the client acknowledges it.
+    Settings(Vec<(u16, u32)>),
+    /// A PING carrying this payload.
+    Ping([u8; 8]),
+    /// A WINDOW_UPDATE of `increment` for the connection (`stream_id` 0) or a client's
+    /// stream, growing its window by it; a stream's window then grows only by these,
+    /// rather than by the data released, as the relaying peer's does. None for a stream
+    /// the connection doesn't have, or an increment the window can't take.
+    WindowUpdate {
+        /// The connection (0) or the client's stream.
+        stream_id: u32,
+        /// The window size increment.
+        increment: u32,
+    },
+    /// A frame of a type HTTP/2 doesn't define, sent as given.
+    Unknown {
+        /// The frame type.
+        kind: u8,
+        /// The flags.
+        flags: u8,
+        /// The stream identifier.
+        stream_id: u32,
+        /// The payload.
+        payload: Bytes,
+    },
+}
+
+/// The client's acknowledgement of a frame a [`Relay`] relayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayedAck {
+    /// Of the earliest relayed SETTINGS frame it hadn't acknowledged.
+    Settings,
+    /// Of a relayed PING carrying this payload.
+    Ping([u8; 8]),
+}
+
+/// Relays another connection's peer's frames to the client of the server connection
+/// taking a [`DeferredPreface`] (see [`DeferredPreface::relay`]): each goes out as it comes,
+/// in order, once that preface went out, and the client's acknowledgements of them come
+/// back (see [`Relay::on_ack`]). Clones share it.
+#[derive(Clone, Debug, Default)]
+pub struct Relay(Arc<Mutex<RelayInner>>);
+
+#[derive(Debug, Default)]
+struct RelayInner {
+    frames: VecDeque<RelayedFrame>,
+    task: Option<Waker>,
+    on_ack: Option<AckHook>,
+    /// Whether the connection ended.
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct AckHook(Arc<dyn Fn(RelayedAck) + Send + Sync>);
+
+impl fmt::Debug for AckHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("AckHook(..)")
+    }
+}
+
+impl Relay {
+    fn lock(&self) -> MutexGuard<'_, RelayInner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sends `frame` to the client, after the frames sent before it.
+    pub fn send(&self, frame: RelayedFrame) {
+        let mut inner = self.lock();
+        if inner.closed {
+            return;
+        }
+        inner.frames.push_back(frame);
+        if let Some(task) = inner.task.take() {
+            task.wake();
+        }
+    }
+
+    /// Calls `hook` with each of the client's acknowledgements of the relayed frames from
+    /// now on as the connection receives it, before it receives the next frame, in place
+    /// of the hook given before.
+    pub fn on_ack(&self, hook: impl Fn(RelayedAck) + Send + Sync + 'static) {
+        self.lock().on_ack = Some(AckHook(Arc::new(hook)));
+    }
+
+    /// The frames to relay so far; `cx` is woken when more come.
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> VecDeque<RelayedFrame> {
+        let mut inner = self.lock();
+        inner.task = Some(cx.waker().clone());
+        std::mem::take(&mut inner.frames)
+    }
+
+    /// Tells the client's acknowledgement `ack`.
+    pub(crate) fn acked(&self, ack: RelayedAck) {
+        let hook = self.lock().on_ack.clone();
+        if let Some(hook) = hook {
+            (hook.0)(ack);
+        }
+    }
+
+    /// Tells that the connection ended: nothing more is relayed.
+    pub(crate) fn close(&self) {
+        let mut inner = self.lock();
+        inner.closed = true;
+        inner.frames.clear();
+        inner.on_ack = None;
     }
 }

@@ -1,12 +1,17 @@
 use crate::codec::UserError;
 use crate::error::Reason;
 use crate::proto::*;
+use std::collections::VecDeque;
 use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub(crate) struct Settings {
-    /// Our local SETTINGS sync state with the remote.
-    local: Local,
+    /// Our own SETTINGS to send to the remote when the socket is ready.
+    to_send: Option<frame::Settings>,
+    /// The SETTINGS sent, our own and relayed ones (see `Relay`), awaiting the remote's
+    /// ACK in the order sent, each with whether it was relayed; each ACK applies the
+    /// earliest.
+    waiting: VecDeque<(frame::Settings, bool)>,
     /// Received SETTINGS frame pending processing. The ACK must be written to
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
@@ -16,34 +21,25 @@ pub(crate) struct Settings {
     has_received_remote_initial_settings: bool,
 }
 
-#[derive(Debug)]
-enum Local {
-    /// We want to send these SETTINGS to the remote when the socket is ready.
-    ToSend(frame::Settings),
-    /// We have sent these SETTINGS and are waiting for the remote to ACK
-    /// before we apply them.
-    WaitingAck(frame::Settings),
-    /// Our local settings are in sync with the remote.
-    Synced,
-}
-
 impl Settings {
     pub(crate) fn new(local: frame::Settings) -> Self {
         Settings {
+            to_send: None,
             // We assume the initial local SETTINGS were flushed during
             // the handshake process.
-            local: Local::WaitingAck(local),
+            waiting: VecDeque::from([(local, false)]),
             remote: None,
             has_received_remote_initial_settings: false,
         }
     }
 
+    /// Handles a received SETTINGS frame; whether it acknowledged a relayed one.
     pub(crate) fn recv_settings<T, B, C, P>(
         &mut self,
         frame: frame::Settings,
         codec: &mut Codec<T, B>,
         streams: &mut Streams<C, P>,
-    ) -> Result<(), Error>
+    ) -> Result<bool, Error>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
@@ -51,8 +47,8 @@ impl Settings {
         P: Peer,
     {
         if frame.is_ack() {
-            match &self.local {
-                Local::WaitingAck(local) => {
+            match self.waiting.pop_front() {
+                Some((local, relayed)) => {
                     tracing::debug!("received settings ACK; applying {:?}", local);
 
                     if let Some(max) = local.max_frame_size() {
@@ -67,11 +63,10 @@ impl Settings {
                         codec.set_recv_header_table_size(val as usize);
                     }
 
-                    streams.apply_local_settings(local)?;
-                    self.local = Local::Synced;
-                    Ok(())
+                    streams.apply_local_settings(&local)?;
+                    Ok(relayed)
                 }
-                Local::ToSend(..) | Local::Synced => {
+                None => {
                     // We haven't sent any SETTINGS frames to be ACKed, so
                     // this is very bizarre! Remote is either buggy or malicious.
                     proto_err!(conn: "received unexpected settings ack");
@@ -83,29 +78,35 @@ impl Settings {
             // always be none!
             assert!(self.remote.is_none());
             self.remote = Some(frame);
-            Ok(())
+            Ok(false)
         }
     }
 
     /// The SETTINGS sent and awaiting its ACK, replaced by `frame`: the frame a deferred
     /// preface sends instead of the configured one.
     pub(crate) fn replace_pending_local(&mut self, frame: frame::Settings) -> frame::Settings {
-        match std::mem::replace(&mut self.local, Local::WaitingAck(frame)) {
-            Local::WaitingAck(local) | Local::ToSend(local) => local,
-            Local::Synced => frame::Settings::default(),
+        match self.waiting.front_mut() {
+            Some((local, false)) => std::mem::replace(local, frame),
+            _ => {
+                self.waiting.push_front((frame, false));
+                frame::Settings::default()
+            }
         }
     }
 
     pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
         assert!(!frame.is_ack());
-        match &self.local {
-            Local::ToSend(..) | Local::WaitingAck(..) => Err(UserError::SendSettingsWhilePending),
-            Local::Synced => {
-                tracing::trace!("queue to send local settings: {:?}", frame);
-                self.local = Local::ToSend(frame);
-                Ok(())
-            }
+        if self.to_send.is_some() || self.waiting.iter().any(|(_, relayed)| !relayed) {
+            return Err(UserError::SendSettingsWhilePending);
         }
+        tracing::trace!("queue to send local settings: {:?}", frame);
+        self.to_send = Some(frame);
+        Ok(())
+    }
+
+    /// Notes `frame`, a relayed SETTINGS frame just sent, which awaits its ACK.
+    pub(crate) fn sent_relayed(&mut self, frame: frame::Settings) {
+        self.waiting.push_back((frame, true));
     }
 
     /// Sets `true` to `self.has_received_remote_initial_settings`.
@@ -156,20 +157,18 @@ impl Settings {
 
         self.remote = None;
 
-        match &self.local {
-            Local::ToSend(settings) => {
-                if !dst.poll_ready(cx)?.is_ready() {
-                    return Poll::Pending;
-                }
-
-                // Buffer the settings frame
-                dst.buffer(settings.clone().into())
-                    .expect("invalid settings frame");
-                tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
-
-                self.local = Local::WaitingAck(settings.clone());
+        if let Some(settings) = self.to_send.take() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                self.to_send = Some(settings);
+                return Poll::Pending;
             }
-            Local::WaitingAck(..) | Local::Synced => {}
+
+            // Buffer the settings frame
+            dst.buffer(settings.clone().into())
+                .expect("invalid settings frame");
+            tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
+
+            self.waiting.push_back((settings, false));
         }
 
         Poll::Ready(Ok(()))

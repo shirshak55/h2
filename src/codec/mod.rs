@@ -168,6 +168,11 @@ where
         self.framed_write().buffer(item)
     }
 
+    /// Buffers `frame`, a whole encoded frame, as is; `poll_ready` must be called first.
+    pub(crate) fn buffer_raw(&mut self, frame: &[u8]) {
+        self.framed_write().buffer_raw(frame)
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().flush(cx)
