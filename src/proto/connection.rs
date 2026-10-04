@@ -263,7 +263,10 @@ where
         let Some(relay) = &self.relay else {
             return Poll::Ready(Ok(()));
         };
-        let relays_acks = relay.relays_acks();
+        // Those the client sent before its first request (its preface's) are acknowledged
+        // here: the relaying peer acknowledged its own peer's.
+        let relays_acks =
+            relay.relays_acks() && !self.inner.streams.as_dyn().last_processed_id().is_zero();
         self.inner.settings.set_relays_acks(relays_acks);
         self.inner.ping_pong.set_relays_acks(relays_acks);
         if self.deferred_preface.is_some() {

@@ -727,7 +727,8 @@ impl Relay {
     /// Leaves acknowledging the client's SETTINGS and PINGs from now on to the relaying
     /// peer, whose acknowledgements of them the frames relayed carry
     /// ([`RelayedFrame::SettingsAck`], [`RelayedFrame::PingAck`]): a SETTINGS frame then
-    /// applies as its acknowledgement goes out. Ends with [`Self::ack_locally`].
+    /// applies as its acknowledgement goes out. Those the client sends before its first
+    /// request are still acknowledged at once. Ends with [`Self::ack_locally`].
     pub fn relay_acks(&self) {
         self.set_relays_acks(true);
     }
