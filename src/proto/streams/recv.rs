@@ -680,6 +680,12 @@ impl Recv {
         Ok(())
     }
 
+    /// Accepts `:protocol` from now on: the client may use it once it has a SETTINGS
+    /// frame enabling it, before acknowledging that (RFC 8441 §3).
+    pub(crate) fn enable_connect_protocol(&mut self) {
+        self.is_extended_connect_protocol_enabled = true;
+    }
+
     pub(crate) fn apply_local_settings(
         &mut self,
         settings: &frame::Settings,

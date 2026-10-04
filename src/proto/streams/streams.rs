@@ -136,7 +136,8 @@ where
 
     /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
     /// (`window`, its increment) written ahead of every other frame: the remote may open
-    /// as many streams as it says, and the connection window grew by the increment.
+    /// as many streams as it says, and the extended CONNECT it enables, and the connection
+    /// window grew by the increment.
     pub fn apply_preface(
         &mut self,
         frame: &frame::Settings,
@@ -146,6 +147,9 @@ where
         let me = &mut *me;
         if let Some(max) = frame.max_concurrent_streams() {
             me.counts.set_max_recv_streams(max as usize);
+        }
+        if frame.is_extended_connect_protocol_enabled() == Some(true) {
+            me.actions.recv.enable_connect_protocol();
         }
         match window {
             Some(incr) => me.actions.recv.grow_connection_window(incr),
@@ -201,6 +205,15 @@ where
 
     pub fn set_max_recv_streams(&mut self, max: usize) {
         self.inner.lock().unwrap().counts.set_max_recv_streams(max);
+    }
+
+    pub fn enable_connect_protocol(&mut self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .actions
+            .recv
+            .enable_connect_protocol();
     }
 
     /// Grows the receive window of the client's mirrored stream `id`, and the connection's,

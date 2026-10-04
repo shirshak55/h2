@@ -344,6 +344,9 @@ where
                         let max = (max as usize).max(self.inner.streams.max_recv_streams());
                         self.inner.streams.set_max_recv_streams(max);
                     }
+                    if settings.is_extended_connect_protocol_enabled() == Some(true) {
+                        self.inner.streams.enable_connect_protocol();
+                    }
                     self.inner.settings.sent_relayed(settings);
                 }
                 RelayedFrame::Ping(payload) => {
