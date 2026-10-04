@@ -691,8 +691,10 @@ impl Recv {
         settings: &frame::Settings,
         store: &mut Store,
     ) -> Result<(), proto::Error> {
-        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
-            self.is_extended_connect_protocol_enabled = val;
+        // It can't be withdrawn once sent (RFC 8441 §3): the acknowledgement of a SETTINGS
+        // frame sent before one enabling it, arriving after that one went out, keeps it.
+        if settings.is_extended_connect_protocol_enabled() == Some(true) {
+            self.enable_connect_protocol();
         }
 
         if let Some(target) = settings.initial_window_size() {
