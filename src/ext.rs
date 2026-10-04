@@ -730,7 +730,9 @@ impl Relay {
     /// peer, whose acknowledgements of them the frames relayed carry
     /// ([`RelayedFrame::SettingsAck`], [`RelayedFrame::PingAck`]): a SETTINGS frame then
     /// applies as its acknowledgement goes out. Those the client sends before its first
-    /// request are still acknowledged at once. Ends with [`Self::ack_locally`].
+    /// request are still acknowledged at once. Ends with [`Self::ack_locally`]. Those it
+    /// sends after its first request go to the relaying peer, even while the connection
+    /// acknowledges them itself: the relayed acknowledgements of those are dropped.
     pub fn relay_acks(&self) {
         self.set_relays_acks(true);
     }

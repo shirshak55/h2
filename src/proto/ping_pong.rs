@@ -19,10 +19,12 @@ pub(crate) struct PingPong {
     user_pings: Option<UserPingsRx>,
     /// The payloads of the relayed PINGs sent (see `Relay`) awaiting their ACKs.
     relayed: Vec<PingPayload>,
-    /// Whether the remote's PINGs await relayed ACKs (see `Relay::relay_acks`), and the
-    /// payloads of those awaiting one, in the order received.
+    /// Whether the remote's PINGs await relayed ACKs (see `Relay::relay_acks`), whether
+    /// they go to the relaying peer (those after the first request), and the payloads of
+    /// those it was sent, in the order received, each with whether it was acknowledged.
     relays_acks: bool,
-    awaiting: VecDeque<PingPayload>,
+    forwards: bool,
+    awaiting: VecDeque<(PingPayload, bool)>,
 }
 
 #[derive(Debug)]
@@ -83,31 +85,47 @@ impl PingPong {
             user_pings: None,
             relayed: Vec::new(),
             relays_acks: false,
+            forwards: false,
             awaiting: VecDeque::new(),
         }
     }
 
-    /// Makes the remote's PINGs from now on await relayed ACKs, or not.
-    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool) {
+    /// Makes the remote's PINGs from now on await relayed ACKs, or not, and tells whether
+    /// they go to the relaying peer.
+    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool, forwards: bool) {
         self.relays_acks = relays_acks;
+        self.forwards = forwards;
     }
 
-    /// Takes the remote's PING carrying `payload` awaiting a relayed ACK, if any: the ACK
-    /// is then due.
+    /// Takes the earliest of the remote's PINGs carrying `payload` the relaying peer was
+    /// sent, whose relayed ACK came: whether its ACK is then due, it awaiting that one.
     pub(crate) fn take_awaiting(&mut self, payload: &PingPayload) -> bool {
         match self
             .awaiting
             .iter()
-            .position(|awaiting| awaiting == payload)
+            .position(|(awaiting, _)| awaiting == payload)
         {
-            Some(index) => self.awaiting.remove(index).is_some(),
+            Some(index) => self
+                .awaiting
+                .remove(index)
+                .map_or(false, |(_, acked)| !acked),
             None => false,
         }
     }
 
     /// The payload of the remote's earliest PING awaiting a relayed ACK.
     pub(crate) fn first_awaiting(&self) -> Option<PingPayload> {
-        self.awaiting.front().copied()
+        self.awaiting
+            .iter()
+            .find(|(_, acked)| !acked)
+            .map(|(payload, _)| *payload)
+    }
+
+    /// Notes that the remote's earliest PING awaiting a relayed ACK is acknowledged.
+    pub(crate) fn ack_awaiting(&mut self) {
+        if let Some((_, acked)) = self.awaiting.iter_mut().find(|(_, acked)| !*acked) {
+            *acked = true;
+        }
     }
 
     /// Notes a relayed PING carrying `payload` just sent, which awaits its ACK.
@@ -178,9 +196,14 @@ impl PingPong {
             tracing::warn!("recv PING ack that we never sent: {:?}", ping);
             ReceivedPing::Unknown
         } else if self.relays_acks && self.awaiting.len() < MAX_AWAITING {
-            self.awaiting.push_back(ping.into_payload());
+            self.awaiting.push_back((ping.into_payload(), false));
             ReceivedPing::AwaitsRelayedAck
         } else {
+            // The relaying peer, which it went to, acknowledges it too (see
+            // `take_awaiting`).
+            if self.forwards && self.awaiting.len() < MAX_AWAITING {
+                self.awaiting.push_back((*ping.payload(), true));
+            }
             // Save the ping's payload to be sent as an acknowledgement.
             self.pending_pong = Some(ping.into_payload());
             ReceivedPing::MustAck

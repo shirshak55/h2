@@ -4,6 +4,10 @@ use crate::proto::*;
 use std::collections::VecDeque;
 use std::task::{Context, Poll};
 
+/// How many SETTINGS frames the relaying peer was sent and that were acknowledged at once
+/// are told apart from those awaiting its ACKs, at most.
+const MAX_ACKED_FORWARDED: usize = 64;
+
 #[derive(Debug)]
 pub(crate) struct Settings {
     /// Our own SETTINGS to send to the remote when the socket is ready.
@@ -16,10 +20,13 @@ pub(crate) struct Settings {
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
     remote: Option<frame::Settings>,
-    /// Whether received SETTINGS await relayed ACKs (see `Relay::relay_acks`), and those
-    /// awaiting one, in the order received: each applies as its ACK goes out.
+    /// Whether received SETTINGS await relayed ACKs (see `Relay::relay_acks`), whether
+    /// they go to the relaying peer (those after the first request), and those it was
+    /// sent, in the order received, whose relayed ACKs come in that order: each awaiting
+    /// one (`Some`) applies as its ACK goes out, the others were acknowledged at once.
     relays_acks: bool,
-    awaiting: VecDeque<frame::Settings>,
+    forwards: bool,
+    awaiting: VecDeque<Option<frame::Settings>>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -34,19 +41,22 @@ impl Settings {
             waiting: VecDeque::from([(local, false)]),
             remote: None,
             relays_acks: false,
+            forwards: false,
             awaiting: VecDeque::new(),
             has_received_remote_initial_settings: false,
         }
     }
 
-    /// Makes received SETTINGS from now on await relayed ACKs, or not.
-    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool) {
+    /// Makes received SETTINGS from now on await relayed ACKs, or not, and tells whether
+    /// they go to the relaying peer.
+    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool, forwards: bool) {
         self.relays_acks = relays_acks;
+        self.forwards = forwards;
     }
 
     /// Whether a received SETTINGS frame awaits a relayed ACK.
     pub(crate) fn is_awaiting(&self) -> bool {
-        !self.awaiting.is_empty()
+        self.awaiting.iter().any(Option::is_some)
     }
 
     /// Acknowledges the earliest received SETTINGS frame awaiting a relayed ACK, if any,
@@ -62,9 +72,29 @@ impl Settings {
         C: Buf,
         P: Peer,
     {
-        match self.awaiting.pop_front() {
+        match self.awaiting.iter_mut().find_map(Option::take) {
             Some(settings) => self.ack_remote(&settings, dst, streams),
             None => Ok(()),
+        }
+    }
+
+    /// Handles a relayed ACK, of the earliest received SETTINGS frame the relaying peer was
+    /// sent: acknowledges and applies that frame unless it was already; the codec is
+    /// ready.
+    pub(crate) fn recv_relayed_ack<T, B, C, P>(
+        &mut self,
+        dst: &mut Codec<T, B>,
+        streams: &mut Streams<C, P>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+        C: Buf,
+        P: Peer,
+    {
+        match self.awaiting.pop_front() {
+            Some(Some(settings)) => self.ack_remote(&settings, dst, streams),
+            _ => Ok(()),
         }
     }
 
@@ -113,8 +143,11 @@ impl Settings {
             // always be none!
             assert!(self.remote.is_none());
             if self.relays_acks || self.is_awaiting() {
-                self.awaiting.push_back(frame);
+                self.awaiting.push_back(Some(frame));
             } else {
+                if self.forwards && self.awaiting.len() < MAX_ACKED_FORWARDED {
+                    self.awaiting.push_back(None);
+                }
                 self.remote = Some(frame);
             }
             Ok(false)

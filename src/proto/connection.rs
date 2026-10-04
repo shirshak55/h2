@@ -264,11 +264,11 @@ where
             return Poll::Ready(Ok(()));
         };
         // Those the client sent before its first request (its preface's) are acknowledged
-        // here: the relaying peer acknowledged its own peer's.
-        let relays_acks =
-            relay.relays_acks() && !self.inner.streams.as_dyn().last_processed_id().is_zero();
-        self.inner.settings.set_relays_acks(relays_acks);
-        self.inner.ping_pong.set_relays_acks(relays_acks);
+        // here: the relaying peer acknowledged its own peer's. Those after go to it.
+        let forwards = !self.inner.streams.as_dyn().last_processed_id().is_zero();
+        let relays_acks = relay.relays_acks() && forwards;
+        self.inner.settings.set_relays_acks(relays_acks, forwards);
+        self.inner.ping_pong.set_relays_acks(relays_acks, forwards);
         if self.deferred_preface.is_some() {
             return Poll::Ready(Ok(()));
         }
@@ -282,7 +282,7 @@ where
             }
             while let Some(payload) = self.inner.ping_pong.first_awaiting() {
                 ready!(self.codec.poll_ready(cx))?;
-                self.inner.ping_pong.take_awaiting(&payload);
+                self.inner.ping_pong.ack_awaiting();
                 self.codec
                     .buffer(frame::Ping::pong(payload).into())
                     .expect("invalid ping frame");
@@ -335,7 +335,7 @@ where
                 RelayedFrame::SettingsAck => self
                     .inner
                     .settings
-                    .ack_awaiting(&mut self.codec, &mut self.inner.streams)?,
+                    .recv_relayed_ack(&mut self.codec, &mut self.inner.streams)?,
                 RelayedFrame::PingAck(payload) => {
                     if self.inner.ping_pong.take_awaiting(&payload) {
                         self.codec
