@@ -743,20 +743,29 @@ where
         self.streams.refuse(last_stream_id, refused);
     }
 
-    fn go_away_now(&mut self, e: Reason) {
+    /// The last stream a GOAWAY sent now names: the latest processed, but not past the one
+    /// a GOAWAY sent before named, which a relayed one can set below it.
+    fn go_away_id(&self) -> StreamId {
         let last_processed_id = self.streams.last_processed_id();
-        let frame = frame::GoAway::new(last_processed_id, e);
+        self.go_away
+            .going_away()
+            .map_or(last_processed_id, |going_away| {
+                last_processed_id.min(going_away.last_processed_id())
+            })
+    }
+
+    fn go_away_now(&mut self, e: Reason) {
+        let frame = frame::GoAway::new(self.go_away_id(), e);
         self.go_away.go_away_now(frame);
     }
 
     fn go_away_now_data(&mut self, e: Reason, data: Bytes) {
-        let last_processed_id = self.streams.last_processed_id();
-        let frame = frame::GoAway::with_debug_data(last_processed_id, e, data);
+        let frame = frame::GoAway::with_debug_data(self.go_away_id(), e, data);
         self.go_away.go_away_now(frame);
     }
 
     fn go_away_from_user(&mut self, e: Reason) {
-        let last_processed_id = self.streams.last_processed_id();
+        let last_processed_id = self.go_away_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_from_user(frame);
 
@@ -893,7 +902,7 @@ where
                             "received unexpected shutdown ping"
                         );
 
-                        let last_processed_id = self.streams.last_processed_id();
+                        let last_processed_id = self.go_away_id();
                         self.go_away(last_processed_id, Reason::NO_ERROR);
                     }
                     ReceivedPing::Relayed(payload) => {
