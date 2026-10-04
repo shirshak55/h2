@@ -171,7 +171,10 @@ where
                 data_frame_budget: config.data_frame_budget,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let mut streams = Streams::new(streams_config(&config));
+        if let Some(preface) = &config.deferred_preface {
+            streams.set_relay(preface.relay());
+        }
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {
@@ -254,15 +257,34 @@ where
     }
 
     /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
-    /// went out.
-    fn poll_relay(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    /// went out, and the acknowledgements due of the client's SETTINGS and PINGs no longer
+    /// awaiting relayed ones.
+    fn poll_relay(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         let Some(relay) = &self.relay else {
             return Poll::Ready(Ok(()));
         };
+        let relays_acks = relay.relays_acks();
+        self.inner.settings.set_relays_acks(relays_acks);
+        self.inner.ping_pong.set_relays_acks(relays_acks);
         if self.deferred_preface.is_some() {
             return Poll::Ready(Ok(()));
         }
         self.relayed.extend(relay.poll_take(cx));
+        if !relays_acks {
+            while self.inner.settings.is_awaiting() {
+                ready!(self.codec.poll_ready(cx))?;
+                self.inner
+                    .settings
+                    .ack_awaiting(&mut self.codec, &mut self.inner.streams)?;
+            }
+            while let Some(payload) = self.inner.ping_pong.first_awaiting() {
+                ready!(self.codec.poll_ready(cx))?;
+                self.inner.ping_pong.take_awaiting(&payload);
+                self.codec
+                    .buffer(frame::Ping::pong(payload).into())
+                    .expect("invalid ping frame");
+            }
+        }
         while !self.relayed.is_empty() {
             ready!(self.codec.poll_ready(cx))?;
             match self.relayed.pop_front().expect("a frame is relayed") {
@@ -304,6 +326,17 @@ where
                     frame.put_u32(stream_id);
                     frame.put(payload);
                     self.codec.buffer_raw(&frame);
+                }
+                RelayedFrame::SettingsAck => self
+                    .inner
+                    .settings
+                    .ack_awaiting(&mut self.codec, &mut self.inner.streams)?,
+                RelayedFrame::PingAck(payload) => {
+                    if self.inner.ping_pong.take_awaiting(&payload) {
+                        self.codec
+                            .buffer(frame::Ping::pong(payload).into())
+                            .expect("invalid ping frame");
+                    }
                 }
             }
         }
@@ -780,7 +813,9 @@ where
                     ReceivedPing::Relayed(payload) => {
                         return Ok(ReceivedFrame::RelayedAck(RelayedAck::Ping(payload)));
                     }
-                    ReceivedPing::MustAck | ReceivedPing::Unknown => {}
+                    ReceivedPing::MustAck
+                    | ReceivedPing::Unknown
+                    | ReceivedPing::AwaitsRelayedAck => {}
                 }
             }
             Some(WindowUpdate(frame)) => {

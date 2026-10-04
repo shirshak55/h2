@@ -616,6 +616,16 @@ impl PushPromise {
         self.header_block.is_over_size
     }
 
+    /// Encodes the header fields in `order`.
+    pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
+        self.header_block.order = order;
+    }
+
+    /// Encodes the block, and lays it out in frames, as `encoding` says.
+    pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
+        self.header_block.send_as = Some(Box::new(encoding));
+    }
+
     pub fn encode(
         self,
         encoder: &mut hpack::Encoder,
@@ -627,11 +637,11 @@ impl PushPromise {
         let head = self.head();
         let promised_id = self.promised_id;
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), None, |dst| {
-                dst.put_u32(promised_id.into());
-            })
+        let mut encoding = self.header_block.into_encoding(encoder);
+        let padding = encoding.padding.take();
+        encoding.encode(&head, dst, Some(encoder), padding, |dst| {
+            dst.put_u32(promised_id.into());
+        })
     }
 
     fn head(&self) -> Head {
@@ -844,6 +854,21 @@ impl EncodingHeaderBlock {
 }
 
 // ===== impl Iter =====
+
+/// The name of `header`, a pseudo-header field, with its colon.
+fn pseudo_name(header: &hpack::Header<Option<HeaderName>>) -> &'static [u8] {
+    use crate::hpack::Header::*;
+
+    match header {
+        Method(_) => b":method",
+        Scheme(_) => b":scheme",
+        Authority(_) => b":authority",
+        Path(_) => b":path",
+        Protocol(_) => b":protocol",
+        Status(_) => b":status",
+        Field { .. } => b"",
+    }
+}
 
 impl Iterator for Iter {
     type Item = hpack::Header<Option<HeaderName>>;
@@ -1168,11 +1193,28 @@ impl HeaderBlock {
                 name: Some(name),
                 value,
             });
-        let headers = Iter {
+        let mut pseudo: Vec<_> = Iter {
             pseudo: Some(self.pseudo),
-            fields: fields.into_iter(),
+            fields: HeaderMap::new().into_iter(),
         }
-        .chain(ordered);
+        .collect();
+        // The pseudo-header fields go in the order recorded.
+        if let Some(encoding) = &self.send_as {
+            pseudo.sort_by_key(|header| {
+                encoding
+                    .fields
+                    .iter()
+                    .position(|field| field.name == pseudo_name(header))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let headers = pseudo
+            .into_iter()
+            .chain(Iter {
+                pseudo: None,
+                fields: fields.into_iter(),
+            })
+            .chain(ordered);
 
         match self.send_as {
             Some(encoding) => {

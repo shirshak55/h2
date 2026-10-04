@@ -4,6 +4,7 @@ use crate::proto::{self, PingPayload};
 
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
+use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,10 @@ pub(crate) struct PingPong {
     user_pings: Option<UserPingsRx>,
     /// The payloads of the relayed PINGs sent (see `Relay`) awaiting their ACKs.
     relayed: Vec<PingPayload>,
+    /// Whether the remote's PINGs await relayed ACKs (see `Relay::relay_acks`), and the
+    /// payloads of those awaiting one, in the order received.
+    relays_acks: bool,
+    awaiting: VecDeque<PingPayload>,
 }
 
 #[derive(Debug)]
@@ -49,7 +54,13 @@ pub(crate) enum ReceivedPing {
     Shutdown,
     /// The ACK of a relayed PING carrying this payload.
     Relayed(PingPayload),
+    /// A PING awaiting a relayed ACK.
+    AwaitsRelayedAck,
 }
+
+/// How many of the remote's PINGs may await relayed ACKs; past them the connection
+/// acknowledges a PING itself, so a remote flooding PINGs holds no more.
+const MAX_AWAITING: usize = 1024;
 
 /// No user ping pending.
 const USER_STATE_EMPTY: usize = 0;
@@ -71,7 +82,32 @@ impl PingPong {
             pending_pong: None,
             user_pings: None,
             relayed: Vec::new(),
+            relays_acks: false,
+            awaiting: VecDeque::new(),
         }
+    }
+
+    /// Makes the remote's PINGs from now on await relayed ACKs, or not.
+    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool) {
+        self.relays_acks = relays_acks;
+    }
+
+    /// Takes the remote's PING carrying `payload` awaiting a relayed ACK, if any: the ACK
+    /// is then due.
+    pub(crate) fn take_awaiting(&mut self, payload: &PingPayload) -> bool {
+        match self
+            .awaiting
+            .iter()
+            .position(|awaiting| awaiting == payload)
+        {
+            Some(index) => self.awaiting.remove(index).is_some(),
+            None => false,
+        }
+    }
+
+    /// The payload of the remote's earliest PING awaiting a relayed ACK.
+    pub(crate) fn first_awaiting(&self) -> Option<PingPayload> {
+        self.awaiting.front().copied()
     }
 
     /// Notes a relayed PING carrying `payload` just sent, which awaits its ACK.
@@ -141,6 +177,9 @@ impl PingPong {
             // so for resiliency, just ignore it for now.
             tracing::warn!("recv PING ack that we never sent: {:?}", ping);
             ReceivedPing::Unknown
+        } else if self.relays_acks && self.awaiting.len() < MAX_AWAITING {
+            self.awaiting.push_back(ping.into_payload());
+            ReceivedPing::AwaitsRelayedAck
         } else {
             // Save the ping's payload to be sent as an acknowledgement.
             self.pending_pong = Some(ping.into_payload());

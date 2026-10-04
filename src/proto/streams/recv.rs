@@ -487,6 +487,7 @@ impl Recv {
             // The relayed peer's WINDOW_UPDATEs grow the windows instead.
             self.in_flight_data -= capacity;
             stream.in_flight_recv_data -= capacity;
+            stream.mirror_unacked = stream.mirror_unacked.saturating_add(capacity);
             return Ok(());
         }
 
@@ -530,6 +531,14 @@ impl Recv {
 
             self.release_connection_capacity(stream.in_flight_recv_data, task);
             stream.in_flight_recv_data = 0;
+        }
+
+        // A reset may drop data released last on its way to the relaying peer, who then
+        // never grows the connection's window by it: it grows here by the data that peer's
+        // WINDOW_UPDATEs on the stream didn't cover, which holds it.
+        if stream.recv_flow.is_mirror() && stream.state.is_reset() && stream.mirror_unacked != 0 {
+            self.release_connection_capacity(stream.mirror_unacked, task);
+            stream.mirror_unacked = 0;
         }
 
         self.clear_recv_buffer(stream, task, counts);

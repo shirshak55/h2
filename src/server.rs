@@ -116,7 +116,7 @@
 //! [`TcpListener`]: https://docs.rs/tokio-core/0.1/tokio_core/net/struct.TcpListener.html
 
 use crate::codec::{Codec, UserError};
-use crate::ext::HeaderOrder;
+use crate::ext::{HeaderBlockEncoding, HeaderOrder};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
@@ -1289,9 +1289,13 @@ impl<B: Buf> SendResponse<B> {
         );
 
         let order = response.extensions_mut().remove::<HeaderOrder>();
-        let frame = Peer::convert_send_message(
+        let encoding = response.extensions_mut().remove::<HeaderBlockEncoding>();
+        let mut frame = Peer::convert_send_message(
             stream_id, response, order, false, // NOT end_of_stream for informational responses
         );
+        if let Some(encoding) = encoding {
+            frame.set_encoding(encoding);
+        }
 
         tracing::trace!(
             "sending interim informational headers frame for stream: {:?}",

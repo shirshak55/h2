@@ -100,6 +100,10 @@ pub(super) struct Stream {
 
     pub in_flight_recv_data: WindowSize,
 
+    /// The data released while the window grows only by relayed WINDOW_UPDATEs (see
+    /// `FlowControl::set_mirror`) that those didn't cover yet.
+    pub mirror_unacked: WindowSize,
+
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -203,6 +207,7 @@ impl Stream {
             is_pending_accept: false,
             recv_flow,
             in_flight_recv_data: 0,
+            mirror_unacked: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,

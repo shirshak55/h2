@@ -16,6 +16,10 @@ pub(crate) struct Settings {
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
     remote: Option<frame::Settings>,
+    /// Whether received SETTINGS await relayed ACKs (see `Relay::relay_acks`), and those
+    /// awaiting one, in the order received: each applies as its ACK goes out.
+    relays_acks: bool,
+    awaiting: VecDeque<frame::Settings>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -29,7 +33,38 @@ impl Settings {
             // the handshake process.
             waiting: VecDeque::from([(local, false)]),
             remote: None,
+            relays_acks: false,
+            awaiting: VecDeque::new(),
             has_received_remote_initial_settings: false,
+        }
+    }
+
+    /// Makes received SETTINGS from now on await relayed ACKs, or not.
+    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool) {
+        self.relays_acks = relays_acks;
+    }
+
+    /// Whether a received SETTINGS frame awaits a relayed ACK.
+    pub(crate) fn is_awaiting(&self) -> bool {
+        !self.awaiting.is_empty()
+    }
+
+    /// Acknowledges the earliest received SETTINGS frame awaiting a relayed ACK, if any,
+    /// and applies it; the codec is ready.
+    pub(crate) fn ack_awaiting<T, B, C, P>(
+        &mut self,
+        dst: &mut Codec<T, B>,
+        streams: &mut Streams<C, P>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+        C: Buf,
+        P: Peer,
+    {
+        match self.awaiting.pop_front() {
+            Some(settings) => self.ack_remote(&settings, dst, streams),
+            None => Ok(()),
         }
     }
 
@@ -77,7 +112,11 @@ impl Settings {
             // We always ACK before reading more frames, so `remote` should
             // always be none!
             assert!(self.remote.is_none());
-            self.remote = Some(frame);
+            if self.relays_acks || self.is_awaiting() {
+                self.awaiting.push_back(frame);
+            } else {
+                self.remote = Some(frame);
+            }
             Ok(false)
         }
     }
@@ -118,6 +157,40 @@ impl Settings {
         !has_received
     }
 
+    /// Acknowledges the received `settings` and applies them; the codec is ready.
+    fn ack_remote<T, B, C, P>(
+        &mut self,
+        settings: &frame::Settings,
+        dst: &mut Codec<T, B>,
+        streams: &mut Streams<C, P>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+        C: Buf,
+        P: Peer,
+    {
+        // Create an ACK settings frame
+        let frame = frame::Settings::ack();
+
+        // Buffer the settings frame
+        dst.buffer(frame.into()).expect("invalid settings frame");
+
+        tracing::trace!("ACK sent; applying settings");
+
+        let is_initial = self.mark_remote_initial_settings_as_received();
+        streams.apply_remote_settings(settings, is_initial)?;
+
+        if let Some(val) = settings.header_table_size() {
+            dst.set_send_header_table_size(val as usize);
+        }
+
+        if let Some(val) = settings.max_frame_size() {
+            dst.set_max_send_frame_size(val as usize);
+        }
+        Ok(())
+    }
+
     pub(crate) fn poll_send<T, B, C, P>(
         &mut self,
         cx: &mut Context,
@@ -135,24 +208,7 @@ impl Settings {
                 return Poll::Pending;
             }
 
-            // Create an ACK settings frame
-            let frame = frame::Settings::ack();
-
-            // Buffer the settings frame
-            dst.buffer(frame.into()).expect("invalid settings frame");
-
-            tracing::trace!("ACK sent; applying settings");
-
-            let is_initial = self.mark_remote_initial_settings_as_received();
-            streams.apply_remote_settings(&settings, is_initial)?;
-
-            if let Some(val) = settings.header_table_size() {
-                dst.set_send_header_table_size(val as usize);
-            }
-
-            if let Some(val) = settings.max_frame_size() {
-                dst.set_max_send_frame_size(val as usize);
-            }
+            self.ack_remote(&settings, dst, streams)?;
         }
 
         self.remote = None;

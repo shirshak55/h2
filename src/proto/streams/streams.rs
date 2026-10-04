@@ -3,7 +3,7 @@ use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::{
-    BodyLayout, DataFrame, HeaderBlockEncoding, HeaderOrder, Protocol, SendBodyLayout,
+    BodyLayout, DataFrame, HeaderBlockEncoding, HeaderOrder, Protocol, Relay, SendBodyLayout,
 };
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
@@ -81,6 +81,11 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+
+    /// Relays another connection's peer's frames to this connection's peer, whose
+    /// streams' windows it may make grow only by relayed WINDOW_UPDATEs (see
+    /// `Relay::mirror_stream_window`).
+    relay: Option<Relay>,
 }
 
 #[derive(Debug)]
@@ -121,6 +126,12 @@ where
         }
     }
 
+    /// Relays another connection's peer's frames through `relay`, which may make the
+    /// remote's streams' windows grow only by relayed WINDOW_UPDATEs.
+    pub fn set_relay(&mut self, relay: Relay) {
+        self.inner.lock().unwrap().relay = Some(relay);
+    }
+
     /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
     /// (`window`, its increment) written ahead of every other frame: the remote may open
     /// as many streams as it says, and the connection window grew by the increment.
@@ -154,6 +165,7 @@ where
         match me.store.find_mut(&id) {
             Some(mut stream) if !stream.state.is_closed() => {
                 stream.recv_flow.set_mirror();
+                stream.mirror_unacked = stream.mirror_unacked.saturating_sub(increment);
                 stream.recv_flow.inc_recv_window(increment).is_ok()
             }
             _ => false,
@@ -526,7 +538,19 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
+            relay: None,
         }))
+    }
+
+    /// Makes `stream`'s window grow only by relayed WINDOW_UPDATEs, if asked to since
+    /// last checked (see `Relay::mirror_stream_window`).
+    fn mirror_if_asked(relay: &Option<Relay>, stream: &mut Stream) {
+        if relay
+            .as_ref()
+            .map_or(false, |relay| relay.take_mirrored(stream.id.into()))
+        {
+            stream.recv_flow.set_mirror();
+        }
     }
 
     fn recv_headers<B>(
@@ -699,6 +723,8 @@ impl Inner {
             }
         };
 
+        let mut stream = stream;
+        Inner::mirror_if_asked(&self.relay, &mut stream);
         let actions = &mut self.actions;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
@@ -1461,6 +1487,8 @@ impl<B> StreamRef<B> {
         &mut self,
         mut request: Request<()>,
     ) -> Result<StreamRef<B>, UserError> {
+        let order = request.extensions_mut().remove::<HeaderOrder>();
+        let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1489,7 +1517,14 @@ impl<B> StreamRef<B> {
         let pushed = {
             let mut stream = me.store.resolve(self.opaque.key);
 
-            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+            let mut frame =
+                crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+            if let Some(order) = order {
+                frame.set_header_order(order);
+            }
+            if let Some(encoding) = encoding {
+                frame.set_encoding(encoding);
+            }
 
             actions
                 .send
@@ -1732,6 +1767,7 @@ impl OpaqueStreamRef {
         let me = &mut *me;
 
         let mut stream = me.store.resolve(self.key);
+        Inner::mirror_if_asked(&me.relay, &mut stream);
 
         me.actions
             .recv

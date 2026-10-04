@@ -4,7 +4,7 @@ use crate::hpack::BytesStr;
 
 use bytes::Bytes;
 use http::HeaderName;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
@@ -658,6 +658,12 @@ pub enum RelayedFrame {
         /// The payload.
         payload: Bytes,
     },
+    /// The acknowledgement of the client's earliest SETTINGS frame awaiting one (see
+    /// [`Relay::relay_acks`]), which applies as it goes out. None when none awaits one.
+    SettingsAck,
+    /// The acknowledgement of the client's PING carrying this payload (see
+    /// [`Relay::relay_acks`]). None when no such PING awaits one.
+    PingAck([u8; 8]),
 }
 
 /// The client's acknowledgement of a frame a [`Relay`] relayed.
@@ -682,6 +688,12 @@ struct RelayInner {
     frames: VecDeque<RelayedFrame>,
     task: Option<Waker>,
     on_ack: Option<AckHook>,
+    /// Whether the client's SETTINGS and PINGs await relayed acknowledgements (see
+    /// [`Relay::relay_acks`]).
+    relays_acks: bool,
+    /// The client's streams whose windows grow only by relayed WINDOW_UPDATEs from the
+    /// data they release next on (see [`Relay::mirror_stream_window`]).
+    mirrored: HashSet<u32>,
     /// Whether the connection ended.
     closed: bool,
 }
@@ -712,6 +724,47 @@ impl Relay {
         }
     }
 
+    /// Leaves acknowledging the client's SETTINGS and PINGs from now on to the relaying
+    /// peer, whose acknowledgements of them the frames relayed carry
+    /// ([`RelayedFrame::SettingsAck`], [`RelayedFrame::PingAck`]): a SETTINGS frame then
+    /// applies as its acknowledgement goes out. Ends with [`Self::ack_locally`].
+    pub fn relay_acks(&self) {
+        self.set_relays_acks(true);
+    }
+
+    /// Makes the connection acknowledge the client's SETTINGS and PINGs itself again, at
+    /// once those awaiting a relayed acknowledgement: once no peer relays them.
+    pub fn ack_locally(&self) {
+        self.set_relays_acks(false);
+    }
+
+    fn set_relays_acks(&self, relays_acks: bool) {
+        let mut inner = self.lock();
+        inner.relays_acks = relays_acks;
+        if let Some(task) = inner.task.take() {
+            task.wake();
+        }
+    }
+
+    /// Makes the receive window of the client's stream `stream_id` grow only by the
+    /// relayed WINDOW_UPDATEs ([`RelayedFrame::WindowUpdate`]) from the data it releases
+    /// next on, rather than by that data, as the relaying peer's window does once that data
+    /// went on to it.
+    pub fn mirror_stream_window(&self, stream_id: u32) {
+        self.lock().mirrored.insert(stream_id);
+    }
+
+    /// Whether the client's SETTINGS and PINGs await relayed acknowledgements.
+    pub(crate) fn relays_acks(&self) -> bool {
+        self.lock().relays_acks
+    }
+
+    /// Whether `stream_id`'s window was made to grow only by relayed WINDOW_UPDATEs since
+    /// last asked (see [`Self::mirror_stream_window`]).
+    pub(crate) fn take_mirrored(&self, stream_id: u32) -> bool {
+        self.lock().mirrored.remove(&stream_id)
+    }
+
     /// Calls `hook` with each of the client's acknowledgements of the relayed frames from
     /// now on as the connection receives it, before it receives the next frame, in place
     /// of the hook given before.
@@ -740,5 +793,6 @@ impl Relay {
         inner.closed = true;
         inner.frames.clear();
         inner.on_ack = None;
+        inner.mirrored.clear();
     }
 }
