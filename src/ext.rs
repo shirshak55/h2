@@ -4,9 +4,9 @@ use crate::hpack::BytesStr;
 
 use bytes::Bytes;
 use http::HeaderName;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
 
 /// Represents the `:protocol` pseudo-header used by
@@ -93,6 +93,9 @@ struct FrameLogInner {
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
     /// Called with every frame logged from now on (see [`FrameLog::on_frame`]).
     hooks: Vec<FrameHook>,
+    /// The bodies kept of the messages whose streams are open, by stream (see
+    /// [`HeadersFrame::body`]).
+    bodies: HashMap<u32, Weak<Mutex<ReceivedBody>>>,
 }
 
 #[derive(Clone)]
@@ -112,6 +115,7 @@ impl FrameLog {
             dropped: 0,
             subscribers: Vec::new(),
             hooks: Vec::new(),
+            bodies: HashMap::new(),
         })))
     }
 
@@ -163,6 +167,26 @@ impl FrameLog {
     /// connection acts on it.
     pub fn on_frame(&self, hook: impl Fn(&LoggedFrame) + Send + Sync + 'static) {
         self.lock().hooks.push(FrameHook(Arc::new(hook)));
+    }
+
+    /// Starts keeping the body of the message whose header block opened `stream_id`.
+    pub(crate) fn open_body(&self, stream_id: u32) -> BodyFrames {
+        let body = BodyFrames::default();
+        let mut inner = self.lock();
+        inner.bodies.retain(|_, body| body.strong_count() > 0);
+        inner.bodies.insert(stream_id, Arc::downgrade(&body.0));
+        body
+    }
+
+    /// The body kept of the message on `stream_id`, or `None` when none is; `end` stops
+    /// keeping it.
+    pub(crate) fn kept_body(&self, stream_id: u32, end: bool) -> Option<Weak<Mutex<ReceivedBody>>> {
+        let mut inner = self.lock();
+        if end {
+            inner.bodies.remove(&stream_id)
+        } else {
+            inner.bodies.get(&stream_id).cloned()
+        }
     }
 }
 
@@ -288,6 +312,8 @@ pub struct HeadersFrame {
     pub never_indexed: Vec<PseudoHeader>,
     /// How its header block went.
     pub encoding: HeaderBlockEncoding,
+    /// How its body goes, kept as it arrives.
+    pub body: BodyFrames,
     /// The frames its connection's peer sent.
     pub connection: FrameLog,
 }
@@ -346,6 +372,84 @@ pub enum LiteralIndexing {
     Without,
     /// It doesn't, nor may an intermediary encoding it again add it (§6.2.3).
     Never,
+}
+
+/// How a message's body went on the wire past its header block, kept as it arrives:
+/// each DATA frame that carried padding or no data or ended the stream (the others
+/// carried data unpadded), and how its trailers' header block went. Clones share it.
+#[derive(Clone, Debug, Default)]
+pub struct BodyFrames(Arc<Mutex<ReceivedBody>>);
+
+#[derive(Debug, Default)]
+pub(crate) struct ReceivedBody {
+    /// How many DATA frames carrying data arrived.
+    data_frames: u64,
+    /// The DATA frames kept and not yet taken.
+    frames: VecDeque<DataFrame>,
+    trailers: Option<HeaderBlockEncoding>,
+}
+
+/// A DATA frame a [`BodyFrames`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DataFrame {
+    /// How many DATA frames carrying data went before it on its stream.
+    pub index: u64,
+    /// The length of its data.
+    pub len: usize,
+    /// Its pad length, when it carried the PADDED flag.
+    pub padding: Option<u8>,
+    /// The END_STREAM flag.
+    pub end_stream: bool,
+}
+
+/// The most DATA frames a [`BodyFrames`] holds untaken; it drops any more.
+const MAX_KEPT_DATA_FRAMES: usize = 1024;
+
+impl BodyFrames {
+    pub(crate) fn upgrade(kept: &Weak<Mutex<ReceivedBody>>) -> Option<Self> {
+        kept.upgrade().map(BodyFrames)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ReceivedBody> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn push_data(&self, len: usize, padding: Option<u8>, end_stream: bool) {
+        let mut body = self.lock();
+        let index = body.data_frames;
+        if len > 0 {
+            body.data_frames += 1;
+        }
+        if (padding.is_some() || len == 0 || end_stream) && body.frames.len() < MAX_KEPT_DATA_FRAMES
+        {
+            body.frames.push_back(DataFrame {
+                index,
+                len,
+                padding,
+                end_stream,
+            });
+        }
+    }
+
+    pub(crate) fn set_trailers(&self, encoding: HeaderBlockEncoding) {
+        self.lock().trailers = Some(encoding);
+    }
+
+    /// Removes and returns the DATA frames kept so far that went no later than the DATA
+    /// frame carrying data at `through`, or every one kept given `None`.
+    pub fn take(&self, through: Option<u64>) -> Vec<DataFrame> {
+        let mut body = self.lock();
+        let end = match through {
+            Some(through) => body.frames.partition_point(|frame| frame.index <= through),
+            None => body.frames.len(),
+        };
+        body.frames.drain(..end).collect()
+    }
+
+    /// Takes how the trailers' header block went, once it arrived.
+    pub fn take_trailers(&self) -> Option<HeaderBlockEncoding> {
+        self.lock().trailers.take()
+    }
 }
 
 /// A frame of a server's connection preface a [`DeferredPreface`] supplies: its SETTINGS,

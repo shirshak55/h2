@@ -1,4 +1,4 @@
-use crate::ext::{FrameLog, HeadersFrame, LoggedFrame};
+use crate::ext::{BodyFrames, FrameLog, HeaderBlockEncoding, HeadersFrame, LoggedFrame};
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -431,7 +431,8 @@ fn decode_frame(
     Ok(Some(frame))
 }
 
-/// Logs a decoded frame, and attaches the log to a HEADERS frame.
+/// Logs a decoded frame, attaches the log to a HEADERS frame, and keeps the body of the
+/// message it opens (see [`HeadersFrame::body`]).
 fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
     let logged = match frame {
         Frame::Settings(_) => settings,
@@ -444,12 +445,24 @@ fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
             priority: f.dependency().to_ext(),
         }),
         Frame::Headers(f) => {
+            let stream_id = f.stream_id().into();
+            let (encoding, body) = match log.kept_body(stream_id, f.is_end_stream()) {
+                Some(kept) => {
+                    if let Some(body) = BodyFrames::upgrade(&kept) {
+                        body.set_trailers(f.take_encoding());
+                    }
+                    (HeaderBlockEncoding::default(), BodyFrames::default())
+                }
+                None if f.is_end_stream() => (f.take_encoding(), BodyFrames::default()),
+                None => (f.take_encoding(), log.open_body(stream_id)),
+            };
             let received = HeadersFrame {
-                stream_id: f.stream_id().into(),
+                stream_id,
                 priority: f.stream_dep().map(|dep| dep.to_ext()),
                 pseudo_order: f.pseudo_order().to_vec(),
                 never_indexed: f.never_indexed().to_vec(),
-                encoding: f.take_encoding(),
+                encoding,
+                body,
                 connection: log.clone(),
             };
             let logged = LoggedFrame::Headers {
@@ -465,16 +478,26 @@ fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
             ack: f.is_ack(),
             payload: *f.payload(),
         }),
-        Frame::Reset(f) => Some(LoggedFrame::Reset {
-            stream_id: f.stream_id().into(),
-            error_code: f.reason().into(),
-        }),
+        Frame::Reset(f) => {
+            log.kept_body(f.stream_id().into(), true);
+            Some(LoggedFrame::Reset {
+                stream_id: f.stream_id().into(),
+                error_code: f.reason().into(),
+            })
+        }
         Frame::GoAway(f) => Some(LoggedFrame::GoAway {
             last_stream_id: f.last_stream_id().into(),
             error_code: f.reason().into(),
             debug_data: f.debug_data().clone(),
         }),
-        Frame::Data(_) | Frame::PushPromise(_) => None,
+        Frame::Data(f) => {
+            let kept = log.kept_body(f.stream_id().into(), f.is_end_stream());
+            if let Some(body) = kept.as_ref().and_then(BodyFrames::upgrade) {
+                body.push_data(f.payload().len(), f.pad_len(), f.is_end_stream());
+            }
+            None
+        }
+        Frame::PushPromise(_) => None,
     };
     if let Some(logged) = logged {
         log.push(logged);

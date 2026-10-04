@@ -99,6 +99,11 @@ impl<T> Data<T> {
         self.data
     }
 
+    /// Returns the pad length it carried, when it carried the `PADDED` flag.
+    pub(crate) fn pad_len(&self) -> Option<u8> {
+        self.pad_len
+    }
+
     pub(crate) fn head(&self) -> Head {
         Head::new(Kind::Data, self.flags.into(), self.stream_id)
     }
