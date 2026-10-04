@@ -48,6 +48,10 @@ pub(super) struct Stream {
     /// TODO: Technically this could be greater than the window size...
     pub buffered_send_data: usize,
 
+    /// The padding planned for the DATA frames buffered (see `frame::Data::plan_mut`),
+    /// which takes window as their data does but no capacity the user sees.
+    pub buffered_send_padding: usize,
+
     /// Whether the DATA frame being written has planned frames left (see
     /// `frame::Data::plan_mut`), which go once it's reclaimed.
     pub sending_planned: bool,
@@ -197,6 +201,7 @@ impl Stream {
             send_flow,
             requested_send_capacity: 0,
             buffered_send_data: 0,
+            buffered_send_padding: 0,
             sending_planned: false,
             send_task: None,
             flush_task: None,
@@ -336,17 +341,23 @@ impl Stream {
         }
     }
 
-    pub fn send_data(&mut self, len: WindowSize, max_buffer_size: usize) {
+    /// The window its buffered DATA frames take, their planned padding included.
+    pub fn buffered_send_window(&self) -> usize {
+        self.buffered_send_data + self.buffered_send_padding
+    }
+
+    pub fn send_data(&mut self, len: WindowSize, padding: WindowSize, max_buffer_size: usize) {
         let prev_capacity = self.capacity(max_buffer_size);
 
         // TODO: proper error handling
-        let _res = self.send_flow.send_data(len);
+        let _res = self.send_flow.send_data(len + padding);
         debug_assert!(_res.is_ok());
 
         // Decrement the stream's buffered data counter
         debug_assert!(self.buffered_send_data >= len as usize);
         self.buffered_send_data -= len as usize;
-        self.requested_send_capacity -= len;
+        self.buffered_send_padding -= padding as usize;
+        self.requested_send_capacity -= len + padding;
 
         tracing::trace!(
             "  sent stream data; available={}; buffered={}; id={:?}; max_buffer_size={} prev={}",
@@ -451,6 +462,7 @@ impl fmt::Debug for Stream {
             .field("send_flow", &self.send_flow)
             .field("requested_send_capacity", &self.requested_send_capacity)
             .field("buffered_send_data", &self.buffered_send_data)
+            .field("buffered_send_padding", &self.buffered_send_padding)
             .h2_field_some("send_task", &self.send_task.as_ref().map(|_| ()))
             .h2_field_if_then(
                 "pending_send",

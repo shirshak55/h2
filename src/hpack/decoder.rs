@@ -21,8 +21,10 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
-    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`].
+    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`] (see
+    /// [`push_size_update`]), and the octets they took.
     size_updates: Vec<usize>,
+    size_update_octets: usize,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -164,12 +166,17 @@ impl Decoder {
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
             size_updates: Vec::new(),
+            size_update_octets: 0,
         }
     }
 
-    /// The dynamic table size updates decoded since the last call, in order.
-    pub fn take_size_updates(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.size_updates)
+    /// The dynamic table size updates decoded since the last call, as
+    /// [`push_size_update`] keeps them, and the octets they took.
+    pub fn take_size_updates(&mut self) -> (Vec<usize>, usize) {
+        (
+            std::mem::take(&mut self.size_updates),
+            std::mem::take(&mut self.size_update_octets),
+        )
     }
 
     /// Queues a potential size update
@@ -278,6 +285,7 @@ impl Decoder {
     }
 
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
+        let start = buf.position();
         let new_size = decode_int(buf, 5)?;
 
         if new_size > self.last_max_update {
@@ -291,7 +299,8 @@ impl Decoder {
         );
 
         self.table.set_max_size(new_size);
-        self.size_updates.push(new_size);
+        push_size_update(&mut self.size_updates, new_size);
+        self.size_update_octets += (buf.position() - start) as usize;
 
         Ok(())
     }
@@ -498,6 +507,20 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
     }
 
     Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
+}
+
+/// Records `size`, a dynamic table size update following `updates`, keeping as many as
+/// RFC 7541 §4.2 lets a block carry: the smallest of them, then the last, which leave
+/// the table as the whole run does.
+pub(crate) fn push_size_update(updates: &mut Vec<usize>, size: usize) {
+    if let [first, second] = updates[..] {
+        let smallest = first.min(second);
+        updates.clear();
+        if smallest < size {
+            updates.push(smallest);
+        }
+    }
+    updates.push(size);
 }
 
 fn peek_u8<B: Buf>(buf: &B) -> Option<u8> {

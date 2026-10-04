@@ -410,7 +410,15 @@ where
         }
 
         if let Some(limit) = builder.frame_log_limit {
-            codec.set_frame_log(crate::ext::FrameLog::new(limit));
+            let log = match &builder.deferred_preface {
+                Some(preface) => {
+                    let log = preface.frame_log();
+                    log.set_limit(limit);
+                    log
+                }
+                None => crate::ext::FrameLog::new(limit),
+            };
+            codec.set_frame_log(log);
         }
 
         // Send initial settings frame, unless it is deferred: then nothing goes out until

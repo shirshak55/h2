@@ -60,6 +60,10 @@ impl Send {
         }
     }
 
+    pub fn flush_user_resets(&mut self) {
+        self.prioritize.flushes_user_resets = true;
+    }
+
     /// Returns the initial send window size
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz
@@ -258,16 +262,19 @@ impl Send {
         // on idle streams and §6.4 says RST_STREAM on idle is a PROTOCOL_ERROR.
         // Keep the queued HEADERS so the stream opens, then send the reset
         // immediately after.
-        if !stream.is_pending_open {
-            // Otherwise, drop any buffered DATA and send the reset after the
-            // HEADERS still queued (a response's head, trailers): they aren't
-            // flow controlled, and as far as the caller knows they were sent, as
-            // the peer of a relay that reset its stream right after its head sent
-            // that head first.
-            //
-            // Note that we don't call `self.recv_err` because we want to enqueue
-            // the reset frame before transitioning the stream inside
-            // `reclaim_all_capacity`.
+        // Otherwise, as far as the caller knows the frames it queued were sent: on a
+        // connection that relays, a user's reset goes after those of them that go at
+        // once (all of them for NO_ERROR), the peer of a relay that reset its stream
+        // having sent them first; the rest, trailers included, is dropped (see
+        // `Prioritize::pop_frame`). Any other reset drops the buffered DATA, going
+        // after the HEADERS queued ahead of it (a response's head): they aren't flow
+        // controlled.
+        //
+        // Note that we don't call `self.recv_err` because we want to enqueue
+        // the reset frame before transitioning the stream inside
+        // `reclaim_all_capacity`.
+        let flushes = initiator == Initiator::User && self.prioritize.flushes_user_resets;
+        if !flushes && !stream.is_pending_open {
             self.prioritize.clear_queue_but_headers(buffer, stream);
         }
 
@@ -276,7 +283,11 @@ impl Send {
         tracing::trace!("send_reset -- queueing; frame={:?}", frame);
         self.prioritize
             .queue_frame(frame.into(), buffer, stream, task);
-        self.prioritize.reclaim_all_capacity(stream, counts);
+        if flushes {
+            self.prioritize.reserve_capacity(0, stream, counts);
+        } else {
+            self.prioritize.reclaim_all_capacity(stream, counts);
+        }
     }
 
     pub fn schedule_implicit_reset(
@@ -541,7 +552,7 @@ impl Send {
                     store.try_for_each(|mut stream| {
                         let stream = &mut *stream;
 
-                        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+                        if stream.state.is_send_closed() && stream.buffered_send_window() == 0 {
                             tracing::trace!(
                                 "skipping send-closed stream; id={:?}; flow={:?}",
                                 stream.id,

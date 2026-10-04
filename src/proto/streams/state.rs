@@ -360,6 +360,15 @@ impl State {
         matches!(self.inner, Closed(Cause::ScheduledLibraryReset(..)))
     }
 
+    /// The reason the user reset the stream with, its RST_STREAM queued behind the frames
+    /// it had queued (see `Send::send_reset`).
+    pub fn get_user_reset(&self) -> Option<Reason> {
+        match self.inner {
+            Closed(Cause::Error(Error::Reset(_, reason, Initiator::User))) => Some(reason),
+            _ => None,
+        }
+    }
+
     pub fn is_local_error(&self) -> bool {
         match self.inner {
             Closed(Cause::Error(ref e) | Cause::ErrorAfterEndStream(ref e)) => e.is_local(),

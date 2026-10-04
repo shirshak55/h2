@@ -25,6 +25,7 @@ pub(crate) struct PingPong {
     relays_acks: bool,
     forwards: bool,
     awaiting: VecDeque<(PingPayload, bool)>,
+    unacked: usize,
 }
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ impl PingPong {
             relays_acks: false,
             forwards: false,
             awaiting: VecDeque::new(),
+            unacked: 0,
         }
     }
 
@@ -105,16 +107,23 @@ impl PingPong {
             .iter()
             .position(|(awaiting, _)| awaiting == payload)
         {
-            Some(index) => self
-                .awaiting
-                .remove(index)
-                .map_or(false, |(_, acked)| !acked),
+            Some(index) => {
+                let due = self
+                    .awaiting
+                    .remove(index)
+                    .map_or(false, |(_, acked)| !acked);
+                self.unacked -= usize::from(due);
+                due
+            }
             None => false,
         }
     }
 
     /// The payload of the remote's earliest PING awaiting a relayed ACK.
     pub(crate) fn first_awaiting(&self) -> Option<PingPayload> {
+        if self.unacked == 0 {
+            return None;
+        }
         self.awaiting
             .iter()
             .find(|(_, acked)| !acked)
@@ -125,6 +134,7 @@ impl PingPong {
     pub(crate) fn ack_awaiting(&mut self) {
         if let Some((_, acked)) = self.awaiting.iter_mut().find(|(_, acked)| !*acked) {
             *acked = true;
+            self.unacked -= 1;
         }
     }
 
@@ -202,6 +212,7 @@ impl PingPong {
             ReceivedPing::Unknown
         } else if self.relays_acks && self.awaiting.len() < MAX_AWAITING {
             self.awaiting.push_back((ping.into_payload(), false));
+            self.unacked += 1;
             ReceivedPing::AwaitsRelayedAck
         } else {
             // The relaying peer, which it went to, acknowledges it too (see

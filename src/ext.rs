@@ -88,6 +88,10 @@ struct FrameLogInner {
     frames: Vec<LoggedFrame>,
     limit: usize,
     dropped: usize,
+    /// How many frames were logged, the limit aside, and how many before the client's
+    /// SETTINGS and PINGs went to the relaying peer (see [`Relay::forward_from_now`]).
+    logged: u64,
+    forward_from: Option<u64>,
     /// Where every frame logged from now on goes, the limit aside (see
     /// [`FrameLog::subscribe`]).
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
@@ -129,6 +133,8 @@ impl FrameLog {
             frames: Vec::new(),
             limit,
             dropped: 0,
+            logged: 0,
+            forward_from: None,
             subscribers: Vec::new(),
             hooks: Vec::new(),
             unhandled: VecDeque::new(),
@@ -143,6 +149,7 @@ impl FrameLog {
 
     pub(crate) fn push(&self, frame: LoggedFrame) {
         let mut inner = self.lock();
+        inner.logged += 1;
         inner
             .subscribers
             .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
@@ -156,6 +163,23 @@ impl FrameLog {
         for hook in hooks {
             (hook.0)(&frame);
         }
+    }
+
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.lock().limit = limit;
+    }
+
+    fn forward_from_now(&self) -> u64 {
+        let mut inner = self.lock();
+        let logged = inner.logged;
+        *inner.forward_from.get_or_insert(logged)
+    }
+
+    /// Whether the latest frame logged came once the client's SETTINGS and PINGs go to the
+    /// relaying peer (see [`Relay::forward_from_now`]).
+    fn forwards_latest(&self) -> bool {
+        let inner = self.lock();
+        matches!(inner.forward_from, Some(from) if inner.logged > from)
     }
 
     /// The frames logged so far, in the order received.
@@ -583,7 +607,7 @@ pub fn deferred_preface() -> (PrefaceSender, DeferredPreface) {
         PrefaceSender(sender),
         DeferredPreface {
             preface: Arc::new(Mutex::new(receiver)),
-            relay: Relay::default(),
+            relay: Relay(Arc::default(), FrameLog::new(0)),
         },
     )
 }
@@ -676,6 +700,13 @@ impl DeferredPreface {
         self.relay.clone()
     }
 
+    /// The [`FrameLog`] of the connection taking this preface, from before it reads the
+    /// client's preface, when built to record frames (see
+    /// [`record_frames`](crate::server::Builder::record_frames)); otherwise it logs none.
+    pub fn frame_log(&self) -> FrameLog {
+        self.relay.1.clone()
+    }
+
     /// The frames to send, once supplied (none when the sender was dropped).
     pub(crate) fn poll_frames(
         &mut self,
@@ -741,8 +772,8 @@ pub enum RelayedAck {
 /// taking a [`DeferredPreface`] (see [`DeferredPreface::relay`]): each goes out as it comes,
 /// in order, once that preface went out, and the client's acknowledgements of them come
 /// back (see [`Relay::on_ack`]). Clones share it.
-#[derive(Clone, Debug, Default)]
-pub struct Relay(Arc<Mutex<RelayInner>>);
+#[derive(Clone, Debug)]
+pub struct Relay(Arc<Mutex<RelayInner>>, FrameLog);
 
 #[derive(Debug, Default)]
 struct RelayInner {
@@ -840,11 +871,26 @@ impl Relay {
     /// peer, whose acknowledgements of them the frames relayed carry
     /// ([`RelayedFrame::SettingsAck`], [`RelayedFrame::PingAck`]): a SETTINGS frame then
     /// applies as its acknowledgement goes out. Those the client sends before its first
-    /// request are still acknowledged at once. Ends with [`Self::ack_locally`]. Those it
-    /// sends after its first request go to the relaying peer, even while the connection
-    /// acknowledges them itself: the relayed acknowledgements of those are dropped.
+    /// request are still acknowledged at once, unless logged after
+    /// [`Self::forward_from_now`]. Ends with [`Self::ack_locally`]. Those it sends after its
+    /// first request go to the relaying peer, even while the connection acknowledges them
+    /// itself: the relayed acknowledgements of those are dropped.
     pub fn relay_acks(&self) {
         self.set_relays_acks(true);
+    }
+
+    /// Makes the client's SETTINGS and PINGs the connection's [`FrameLog`] (see
+    /// [`DeferredPreface::frame_log`]) logs from now on go to the relaying peer, as those
+    /// after its first request do, before that request too: how many frames it logged
+    /// before, which it handles as before. Calls after the first change nothing and tell
+    /// the same number.
+    pub fn forward_from_now(&self) -> u64 {
+        self.1.forward_from_now()
+    }
+
+    /// Whether the client's latest frame logged came after [`Self::forward_from_now`].
+    pub(crate) fn forwards_latest(&self) -> bool {
+        self.1.forwards_latest()
     }
 
     /// Makes the connection acknowledge the client's SETTINGS and PINGs itself again, at
@@ -895,6 +941,12 @@ impl Relay {
     /// [`Self::mirror_stream_window`]).
     pub(crate) fn take_mirrored(&self, stream_id: u32) -> Option<bool> {
         self.lock().mirrored.remove(&stream_id)
+    }
+
+    /// The streams made to grow only by relayed WINDOW_UPDATEs since last asked (see
+    /// [`Self::take_mirrored`]).
+    pub(crate) fn take_all_mirrored(&self) -> HashMap<u32, bool> {
+        std::mem::take(&mut self.lock().mirrored)
     }
 
     /// The padding the client's streams received that the relaying peer wasn't sent, told

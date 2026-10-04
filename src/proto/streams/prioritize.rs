@@ -56,6 +56,10 @@ pub(super) struct Prioritize {
 
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
+
+    /// Whether a user's reset goes after the frames queued before it that go at once (see
+    /// `Send::send_reset`), as on a connection that relays.
+    pub(super) flushes_user_resets: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -101,6 +105,7 @@ impl Prioritize {
             last_opened_id: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
+            flushes_user_resets: false,
         }
     }
 
@@ -169,8 +174,9 @@ impl Prioritize {
             }
         }
 
-        // Update the buffered data counter, its padding counting as it does
-        stream.buffered_send_data += sz as usize + frame.planned_padding_len();
+        // Update the buffered data counter, and the padding planned for it
+        stream.buffered_send_data += sz as usize;
+        stream.buffered_send_padding += frame.planned_padding_len();
 
         let span =
             tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
@@ -179,10 +185,10 @@ impl Prioritize {
 
         // Implicitly request more send capacity if not enough has been
         // requested yet.
-        if (stream.requested_send_capacity as usize) < stream.buffered_send_data {
+        if (stream.requested_send_capacity as usize) < stream.buffered_send_window() {
             // Update the target requested capacity
             stream.requested_send_capacity =
-                cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
+                cmp::min(stream.buffered_send_window(), WindowSize::MAX as usize) as WindowSize;
 
             // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
             // cannot be assigned at the time it is called.
@@ -232,14 +238,14 @@ impl Prioritize {
             "reserve_capacity",
             ?stream.id,
             requested = capacity,
-            effective = (capacity as usize) + stream.buffered_send_data,
+            effective = (capacity as usize) + stream.buffered_send_window(),
             curr = stream.requested_send_capacity
         );
         let _e = span.enter();
 
         // Actual capacity is `capacity` + the current amount of buffered data.
         // If it were less, then we could never send out the buffered data.
-        let capacity = (capacity as usize) + stream.buffered_send_data;
+        let capacity = (capacity as usize) + stream.buffered_send_window();
 
         match capacity.cmp(&(stream.requested_send_capacity as usize)) {
             Ordering::Equal => {
@@ -297,7 +303,7 @@ impl Prioritize {
         );
         let _e = span.enter();
 
-        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+        if stream.state.is_send_closed() && stream.buffered_send_window() == 0 {
             // We can't send any data, so don't bother doing anything else.
             return Ok(());
         }
@@ -342,7 +348,7 @@ impl Prioritize {
     /// buffered data, once it goes unpadded, and gives the connection back the capacity
     /// assigned for them.
     fn drop_padding(&mut self, padding_len: usize, stream: &mut store::Ptr, counts: &mut Counts) {
-        stream.buffered_send_data -= padding_len;
+        stream.buffered_send_padding -= padding_len;
         stream.requested_send_capacity = stream
             .requested_send_capacity
             .saturating_sub(padding_len as WindowSize);
@@ -356,13 +362,37 @@ impl Prioritize {
         }
     }
 
+    /// Drops the frames a stream the user reset had queued ahead of its RST_STREAM once one
+    /// of their DATA frames can't go at once, as the one just popped, so that its
+    /// RST_STREAM goes next (see `Send::send_reset`).
+    fn drop_until_reset<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        while let Some(frame) = stream.pending_send.pop_front(buffer) {
+            if let Frame::Reset(_) = frame {
+                stream.pending_send.push_front(buffer, frame);
+                break;
+            }
+            tracing::trace!(?frame, "dropping");
+        }
+        stream.buffered_send_data = 0;
+        stream.buffered_send_padding = 0;
+        stream.requested_send_capacity = 0;
+        stream.sending_planned = false;
+        self.reclaim_all_capacity(stream, counts);
+        self.pending_send.push(stream);
+    }
+
     /// Reclaim just reserved capacity, not buffered capacity, and re-assign
     /// it to the connection
     pub fn reclaim_reserved_capacity(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
         // only reclaim reserved capacity that isn't already buffered
-        if stream.send_flow.available().as_size() as usize > stream.buffered_send_data {
-            let reserved =
-                stream.send_flow.available().as_size() - stream.buffered_send_data as WindowSize;
+        if stream.send_flow.available().as_size() as usize > stream.buffered_send_window() {
+            let reserved = stream.send_flow.available().as_size()
+                - stream.buffered_send_window() as WindowSize;
 
             // Panic safety: due to how `reserved` is computed it can't be greater
             // than what's available.
@@ -411,7 +441,7 @@ impl Prioritize {
             // became available. In that case, the stream won't want any
             // capacity, and so we shouldn't "transition" on it, but just evict
             // it and continue the loop.
-            if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
+            if !(stream.state.is_send_streaming() || stream.buffered_send_window() > 0) {
                 continue;
             }
 
@@ -461,7 +491,7 @@ impl Prioritize {
         }
 
         // The stream may have been reset or closed since capacity was requested.
-        if !stream.state.is_send_streaming() && stream.buffered_send_data == 0 {
+        if !stream.state.is_send_streaming() && stream.buffered_send_window() == 0 {
             return;
         }
 
@@ -506,7 +536,7 @@ impl Prioritize {
 
         // If data is buffered and the stream is send ready, then
         // schedule the stream for execution
-        if stream.buffered_send_data > 0 && stream.is_send_ready() {
+        if stream.buffered_send_window() > 0 && stream.is_send_ready() {
             // TODO: This assertion isn't *exactly* correct. There can still be
             // buffered send data while the stream's pending send queue is
             // empty. This can happen when a large data frame is in the process
@@ -658,8 +688,9 @@ impl Prioritize {
             }
 
             // Its planned frames go whatever the window: an empty one takes none of it, and
-            // padding it lacks room for is dropped.
-            let planned = !frame.plan_mut().is_empty();
+            // padding it lacks room for is dropped. A stream reset since sends the rest only
+            // as far as it goes at once.
+            let planned = !frame.plan_mut().is_empty() || self.flushes_before_reset(&stream);
             self.push_back_frame(frame.into(), buffer, &mut stream);
             if planned {
                 self.pending_send.push(&mut stream);
@@ -700,6 +731,7 @@ impl Prioritize {
         stream.notify_flushed();
 
         stream.buffered_send_data = 0;
+        stream.buffered_send_padding = 0;
         stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
             if stream.key() == key {
@@ -710,18 +742,26 @@ impl Prioritize {
         }
     }
 
-    /// Like [`Self::clear_queue`], but keeps the stream's queued HEADERS frames,
-    /// in order.
+    /// Like [`Self::clear_queue`], but keeps the stream's HEADERS frames queued ahead of
+    /// the data it drops, in order: trailers go only with the data before them.
     pub fn clear_queue_but_headers<B>(
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
     ) {
+        // The rest of the DATA frame being written is dropped too.
+        let mut dropped_data = matches!(
+            self.in_flight_data_frame,
+            InFlightData::DataFrame(key) if key == stream.key()
+        );
         let mut headers = Vec::new();
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
             match frame {
-                Frame::Headers(_) => headers.push(frame),
-                frame => tracing::trace!(?frame, "dropping"),
+                Frame::Headers(_) if !dropped_data => headers.push(frame),
+                frame => {
+                    dropped_data |= matches!(frame, Frame::Data(_));
+                    tracing::trace!(?frame, "dropping");
+                }
             }
         }
         let kept = !headers.is_empty();
@@ -733,6 +773,7 @@ impl Prioritize {
         }
 
         stream.buffered_send_data = 0;
+        stream.buffered_send_padding = 0;
         stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
             if stream.key() == key {
@@ -810,6 +851,7 @@ impl Prioritize {
                             // Get the amount of capacity remaining for stream's
                             // window.
                             let stream_capacity = stream.send_flow.available();
+                            let flushing = self.flushes_before_reset(&stream);
 
                             // The frame it goes as next, when laid out (see
                             // `Data::plan_mut`): an empty one carries none of it.
@@ -819,13 +861,17 @@ impl Prioritize {
                                 _ => frame.payload().remaining(),
                             };
 
-                            // A padded frame goes whole, else unpadded.
+                            // A padded frame goes whole, waiting for the capacity its
+                            // padding takes too, unless it can't fit a frame or the
+                            // peer's windows, or must go at once: it then goes unpadded.
                             let mut padding = planned.and_then(|planned| planned.padding);
                             let padded_len = sz + padding.map_or(0, |pad| usize::from(pad) + 1);
                             if padding.is_some()
                                 && (padded_len > max_len
-                                    || padded_len > stream_capacity.as_size() as usize
-                                    || padded_len > stream.send_flow.window_size() as usize)
+                                    || padded_len > stream.send_flow.window_size() as usize
+                                    || padded_len > self.flow.window_size() as usize
+                                    || (flushing
+                                        && padded_len > stream_capacity.as_size() as usize))
                             {
                                 self.drop_padding(padded_len - sz, &mut stream, counts);
                                 frame.plan_mut()[0].padding = None;
@@ -844,8 +890,11 @@ impl Prioritize {
                             );
 
                             // Zero length data frames always have capacity to
-                            // be sent.
-                            if sz > 0 && stream_capacity == 0 {
+                            // be sent, but for their padding.
+                            if (sz > 0 && stream_capacity == 0)
+                                || (padding.is_some()
+                                    && padded_len > stream_capacity.as_size() as usize)
+                            {
                                 tracing::trace!("stream capacity is 0");
 
                                 // Ensure that the stream is waiting for
@@ -858,7 +907,11 @@ impl Prioritize {
                                 // happen if the remote reduced the stream
                                 // window. In this case, we need to buffer the
                                 // frame and wait for a window update...
-                                stream.pending_send.push_front(buffer, frame.into());
+                                if flushing {
+                                    self.drop_until_reset(buffer, &mut stream, counts);
+                                } else {
+                                    stream.pending_send.push_front(buffer, frame.into());
+                                }
 
                                 continue;
                             }
@@ -881,7 +934,11 @@ impl Prioritize {
                             // scenarios, maybe the window we know is available but the window which
                             // peer knows is not.
                             if flow_len > 0 && flow_len > stream.send_flow.window_size() {
-                                stream.pending_send.push_front(buffer, frame.into());
+                                if flushing {
+                                    self.drop_until_reset(buffer, &mut stream, counts);
+                                } else {
+                                    stream.pending_send.push_front(buffer, frame.into());
+                                }
                                 continue;
                             }
 
@@ -889,7 +946,7 @@ impl Prioritize {
 
                             // Update the flow control
                             tracing::trace_span!("updating stream flow").in_scope(|| {
-                                stream.send_data(flow_len, self.max_buffer_size);
+                                stream.send_data(len, padding_len, self.max_buffer_size);
 
                                 // Assign the capacity back to the connection that
                                 // was just consumed from the stream in the previous
@@ -1020,6 +1077,13 @@ impl Prioritize {
         }
 
         None
+    }
+
+    /// Whether the user reset `stream` with frames still queued, which go ahead of its
+    /// RST_STREAM as far as they can at once (see `Send::send_reset`).
+    fn flushes_before_reset(&self, stream: &Stream) -> bool {
+        self.flushes_user_resets
+            && matches!(stream.state.get_user_reset(), Some(reason) if reason != Reason::NO_ERROR)
     }
 }
 

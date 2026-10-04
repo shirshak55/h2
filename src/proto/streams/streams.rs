@@ -129,7 +129,9 @@ where
     /// Relays another connection's peer's frames through `relay`, which may make the
     /// remote's streams' windows grow only by relayed WINDOW_UPDATEs.
     pub fn set_relay(&mut self, relay: Relay) {
-        self.inner.lock().unwrap().relay = Some(relay);
+        let mut me = self.inner.lock().unwrap();
+        me.relay = Some(relay);
+        me.actions.send.flush_user_resets();
     }
 
     /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
@@ -185,6 +187,20 @@ where
             }
             _ => None,
         }
+    }
+
+    /// Makes stream `id`'s window grow only by relayed WINDOW_UPDATEs (see
+    /// `Relay::mirror_stream_window`).
+    pub fn mirror_stream_window(&mut self, id: StreamId, relays_padding: bool) {
+        let mut me = self.inner.lock().unwrap();
+        if let Some(mut stream) = me.store.find_mut(&id) {
+            stream.recv_flow.set_mirror();
+            stream.relays_padding = relays_padding;
+        }
+    }
+
+    pub fn set_max_recv_streams(&mut self, max: usize) {
+        self.inner.lock().unwrap().counts.set_max_recv_streams(max);
     }
 
     /// Grows the receive window of the client's mirrored stream `id`, and the connection's,
@@ -548,13 +564,10 @@ impl<B> DynStreams<'_, B> {
         me.actions.recv.go_away(last_processed_id);
     }
 
-    /// Refuses (REFUSED_STREAM) each open stream the peer opened past `last_processed_id`,
-    /// which a GOAWAY naming it tells the peer went unprocessed, and each one of `unprocessed`.
-    pub fn refuse(
-        &mut self,
-        last_processed_id: StreamId,
-        unprocessed: &[u32],
-    ) -> Result<(), crate::proto::error::GoAway> {
+    /// Refuses each open stream the peer opened past `last_processed_id`, which a GOAWAY
+    /// naming it tells the peer went unprocessed, closing it with no RST_STREAM, and each
+    /// one of `unprocessed` at or below it with RST_STREAM(REFUSED_STREAM).
+    pub fn refuse(&mut self, last_processed_id: StreamId, unprocessed: &[u32]) {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
         let peer = me.counts.peer();
@@ -567,10 +580,30 @@ impl<B> DynStreams<'_, B> {
                 refused.push(stream.id);
             }
         });
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
         for id in refused {
-            me.send_reset(self.send_buffer, id, Reason::REFUSED_STREAM)?;
+            let Some(stream) = me.store.find_mut(&id) else {
+                continue;
+            };
+            if id > last_processed_id {
+                let actions = &mut me.actions;
+                let err = Error::Reset(id, Reason::REFUSED_STREAM, Initiator::Library);
+                me.counts.transition(stream, |counts, stream| {
+                    actions.recv.handle_error(&err, stream);
+                    actions.send.handle_error(send_buffer, stream, counts);
+                });
+            } else {
+                let _res = me.actions.send_reset(
+                    stream,
+                    Reason::REFUSED_STREAM,
+                    Initiator::User,
+                    &mut me.counts,
+                    send_buffer,
+                );
+                debug_assert!(_res.is_ok());
+            }
         }
-        Ok(())
     }
 }
 

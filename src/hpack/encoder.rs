@@ -2,10 +2,15 @@ use super::table::{Index, Table};
 use super::{huffman, Header};
 use crate::ext::{FieldRepresentation, HeaderBlockEncoding, LiteralIndexing};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use http::header::{HeaderName, HeaderValue};
+use std::collections::{HashMap, VecDeque};
 
 const DEFAULT_MAX_ALLOWED_SIZE: usize = 4 * 1024;
+
+/// The largest table a recorded size update may grow the encoder's to (see
+/// [`Encoder::encode_as`]) past its own cap: the one browsers allow.
+const MAX_RECORDED_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct Encoder {
@@ -153,6 +158,18 @@ impl Encoder {
 
         self.encode_size_updates_as(&encoding.size_updates, dst);
 
+        // The recorded fields of each name, and of each value of it, in order: each is
+        // taken once, the first not taken of the same field, else of the same name.
+        let mut recorded =
+            HashMap::<Bytes, (VecDeque<usize>, HashMap<Bytes, VecDeque<usize>>)>::new();
+        for (at, field) in encoding.fields.iter().enumerate() {
+            let (named, by_value) = recorded.entry(field.name.clone()).or_default();
+            named.push_back(at);
+            by_value
+                .entry(field.value.clone())
+                .or_default()
+                .push_back(at);
+        }
         let mut taken = vec![false; encoding.fields.len()];
         let mut last_name = None;
         for header in headers {
@@ -170,18 +187,18 @@ impl Encoder {
                     value,
                 },
             };
-            let name = header.name();
-            let recorded = (0..encoding.fields.len())
-                .find(|&at| {
-                    !taken[at]
-                        && encoding.fields[at].name == name.as_slice()
-                        && encoding.fields[at].value == header.value_slice()
-                })
-                .or_else(|| {
-                    (0..encoding.fields.len())
-                        .find(|&at| !taken[at] && encoding.fields[at].name == name.as_slice())
+            let mut untaken = |queue: &mut VecDeque<usize>| {
+                std::iter::from_fn(|| queue.pop_front()).find(|&at| !taken[at])
+            };
+            let at = recorded
+                .get_mut(header.name().as_slice())
+                .and_then(|(named, by_value)| {
+                    by_value
+                        .get_mut(header.value_slice())
+                        .and_then(&mut untaken)
+                        .or_else(|| untaken(named))
                 });
-            match recorded {
+            match at {
                 Some(at) => {
                     taken[at] = true;
                     let representation = encoding.fields[at].representation;
@@ -251,7 +268,8 @@ impl Encoder {
         }
     }
 
-    /// Encodes the size updates `recorded` lists, when the peer allows them, in place of
+    /// Encodes the size updates `recorded` lists, when the peer allows them and they keep
+    /// the table within `MAX_RECORDED_SIZE`, in place of
     /// those queued unless one of those lowers the table further; and those queued
     /// otherwise, or when they lower it (an increase the encoder needn't take).
     fn encode_size_updates_as(&mut self, recorded: &[usize], dst: &mut BytesMut) {
@@ -261,7 +279,10 @@ impl Encoder {
             None => None,
         };
         let must_lower = lowest_queued.filter(|&lowest| lowest < self.table.max_size());
-        if recorded.iter().any(|&size| size > self.peer_max_size) {
+        if recorded
+            .iter()
+            .any(|&size| size > self.peer_max_size.min(MAX_RECORDED_SIZE))
+        {
             self.encode_size_updates(dst);
             return;
         }

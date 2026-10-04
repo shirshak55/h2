@@ -469,7 +469,10 @@ impl Recv {
         // Decrement in-flight data
         self.in_flight_data -= capacity;
 
-        // Assign capacity to connection
+        self.assign_connection_capacity(capacity, task);
+    }
+
+    fn assign_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
         // TODO: proper error handling
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
@@ -577,7 +580,7 @@ impl Recv {
         // never grows the connection's window by it: it grows here by the data that peer's
         // WINDOW_UPDATEs on the stream didn't cover, which holds it.
         if stream.recv_flow.is_mirror() && stream.state.is_reset() && stream.mirror_unacked != 0 {
-            self.release_connection_capacity(stream.mirror_unacked, task);
+            self.assign_connection_capacity(stream.mirror_unacked, task);
             self.mirror_covered -= u64::from(stream.mirror_unacked);
             stream.mirror_unacked = 0;
         }
@@ -596,8 +599,20 @@ impl Recv {
         peer_sent: u64,
     ) -> WindowSize {
         let owed = peer_sent.saturating_sub(self.mirror_covered + self.relay_repaid);
-        let repaid = owed.min(u64::from(increment)) as WindowSize;
-        self.relay_repaid += u64::from(repaid);
+        // Credit the connection gave itself but didn't announce yet is taken back instead,
+        // so the relayed WINDOW_UPDATE grants it now.
+        let unannounced = self
+            .flow
+            .available()
+            .as_size()
+            .saturating_sub(self.flow.window_size());
+        let cancelled = owed.min(u64::from(unannounced)) as WindowSize;
+        if cancelled > 0 {
+            let _res = self.flow.claim_capacity(cancelled);
+            debug_assert!(_res.is_ok());
+        }
+        let repaid = (owed - u64::from(cancelled)).min(u64::from(increment)) as WindowSize;
+        self.relay_repaid += u64::from(cancelled + repaid);
         increment - repaid
     }
 

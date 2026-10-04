@@ -8,6 +8,10 @@ use std::task::{Context, Poll};
 /// are told apart from those awaiting its ACKs, at most.
 const MAX_ACKED_FORWARDED: usize = 64;
 
+/// How many received SETTINGS frames may await relayed ACKs; one more ends the connection
+/// (ENHANCE_YOUR_CALM).
+const MAX_AWAITING: usize = 1024;
+
 #[derive(Debug)]
 pub(crate) struct Settings {
     /// Our own SETTINGS to send to the remote when the socket is ready.
@@ -27,6 +31,7 @@ pub(crate) struct Settings {
     relays_acks: bool,
     forwards: bool,
     awaiting: VecDeque<Option<frame::Settings>>,
+    unacked: usize,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -43,6 +48,7 @@ impl Settings {
             relays_acks: false,
             forwards: false,
             awaiting: VecDeque::new(),
+            unacked: 0,
             has_received_remote_initial_settings: false,
         }
     }
@@ -56,7 +62,7 @@ impl Settings {
 
     /// Whether a received SETTINGS frame awaits a relayed ACK.
     pub(crate) fn is_awaiting(&self) -> bool {
-        self.awaiting.iter().any(Option::is_some)
+        self.unacked != 0
     }
 
     /// Acknowledges the earliest received SETTINGS frame awaiting a relayed ACK, if any,
@@ -73,7 +79,10 @@ impl Settings {
         P: Peer,
     {
         match self.awaiting.iter_mut().find_map(Option::take) {
-            Some(settings) => self.ack_remote(&settings, dst, streams),
+            Some(settings) => {
+                self.unacked -= 1;
+                self.ack_remote(&settings, dst, streams)
+            }
             None => Ok(()),
         }
     }
@@ -93,7 +102,10 @@ impl Settings {
         P: Peer,
     {
         match self.awaiting.pop_front() {
-            Some(Some(settings)) => self.ack_remote(&settings, dst, streams),
+            Some(Some(settings)) => {
+                self.unacked -= 1;
+                self.ack_remote(&settings, dst, streams)
+            }
             _ => Ok(()),
         }
     }
@@ -129,6 +141,15 @@ impl Settings {
                     }
 
                     streams.apply_local_settings(&local)?;
+                    if let Some(max) = local.max_concurrent_streams() {
+                        // A raise sent since applied as it went out.
+                        let raised = self
+                            .waiting
+                            .iter()
+                            .filter_map(|(sent, _)| sent.max_concurrent_streams())
+                            .max();
+                        streams.set_max_recv_streams(max.max(raised.unwrap_or(0)) as usize);
+                    }
                     Ok(relayed)
                 }
                 None => {
@@ -143,7 +164,14 @@ impl Settings {
             // always be none!
             assert!(self.remote.is_none());
             if self.relays_acks || self.is_awaiting() {
+                if self.awaiting.len() >= MAX_AWAITING {
+                    return Err(Error::library_go_away_data(
+                        Reason::ENHANCE_YOUR_CALM,
+                        "too_many_settings_awaiting_ack",
+                    ));
+                }
                 self.awaiting.push_back(Some(frame));
+                self.unacked += 1;
             } else {
                 if self.forwards && self.awaiting.len() < MAX_ACKED_FORWARDED {
                     self.awaiting.push_back(None);

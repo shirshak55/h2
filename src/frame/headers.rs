@@ -817,7 +817,11 @@ impl EncodingHeaderBlock {
 
         // Now, encode the header payload
         let room = dst.remaining_mut() - pad;
-        let len = self.fragments.pop_front().map_or(room, |len| len.min(room));
+        // The last fragment recorded takes the rest of a block grown since.
+        let len = match self.fragments.pop_front() {
+            Some(len) if !self.fragments.is_empty() => len.min(room),
+            _ => room,
+        };
         let continuation = if self.hpack.len() > len {
             let head_part = self.hpack.split_to(len);
             dst.put_slice(&head_part);
@@ -1160,9 +1164,19 @@ impl HeaderBlock {
             ControlFlow::Continue(())
         });
 
-        self.encoding
-            .size_updates
-            .extend(decoder.take_size_updates());
+        let (size_updates, octets) = decoder.take_size_updates();
+        for size in size_updates {
+            hpack::push_size_update(&mut self.encoding.size_updates, size);
+        }
+        // Size updates count toward the list's size by the octets they took, so a block
+        // of nothing else is bounded as one of fields is.
+        self.field_size += octets;
+        headers_size += octets;
+        if headers_size > max_header_list_abuse_size {
+            header_list_way_too_large = true;
+        } else if headers_size >= max_header_list_size {
+            self.is_over_size = true;
+        }
 
         match res {
             Ok(()) => {}
