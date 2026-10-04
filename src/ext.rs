@@ -97,6 +97,8 @@ struct FrameLogInner {
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
     /// Called with every frame logged from now on (see [`FrameLog::on_frame`]).
     hooks: Vec<FrameHook>,
+    /// Ready once the connection may read the next frame (see [`FrameLog::gate_reads`]).
+    gate: Option<ReadGate>,
     /// The streams of the latest requests the connection didn't hand over, oldest first,
     /// and the hooks called with each from now on (see [`FrameLog::on_unhandled`]).
     unhandled: VecDeque<u32>,
@@ -112,6 +114,15 @@ struct FrameHook(Arc<dyn Fn(&LoggedFrame) + Send + Sync>);
 impl fmt::Debug for FrameHook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("FrameHook(..)")
+    }
+}
+
+#[derive(Clone)]
+struct ReadGate(Arc<dyn Fn(&mut Context<'_>) -> std::task::Poll<()> + Send + Sync>);
+
+impl fmt::Debug for ReadGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("ReadGate(..)")
     }
 }
 
@@ -137,6 +148,7 @@ impl FrameLog {
             forward_from: None,
             subscribers: Vec::new(),
             hooks: Vec::new(),
+            gate: None,
             unhandled: VecDeque::new(),
             unhandled_hooks: Vec::new(),
             bodies: HashMap::new(),
@@ -209,6 +221,23 @@ impl FrameLog {
     /// connection acts on it.
     pub fn on_frame(&self, hook: impl Fn(&LoggedFrame) + Send + Sync + 'static) {
         self.lock().hooks.push(FrameHook(Arc::new(hook)));
+    }
+
+    /// Has the connection read each next frame only once `room` is ready, from now on, in
+    /// place of the one given before: a caller passing the frames on as they arrive (see
+    /// [`Self::subscribe`]) holds the client back while it lags, as the peer it passes
+    /// them to would, rather than having them queue without bound.
+    pub fn gate_reads(
+        &self,
+        room: impl Fn(&mut Context<'_>) -> std::task::Poll<()> + Send + Sync + 'static,
+    ) {
+        self.lock().gate = Some(ReadGate(Arc::new(room)));
+    }
+
+    /// Ready once the connection may read the next frame (see [`Self::gate_reads`]).
+    pub(crate) fn poll_gate(&self, cx: &mut Context<'_>) -> std::task::Poll<()> {
+        let gate = self.lock().gate.clone();
+        gate.map_or(std::task::Poll::Ready(()), |gate| (gate.0)(cx))
     }
 
     /// Calls `hook` with the stream of each request whose HEADERS the connection received
@@ -538,9 +567,10 @@ impl BodyFrames {
 ///
 /// A response sent with a [`SendBodyLayout`] goes so: ahead of each chunk of its body go
 /// the empty DATA frames the layout has there, the chunk takes its frame's padding when
-/// their lengths match, and its end goes in a frame of its own when the layout's did, as
-/// far as the peer's frame size and flow control allow a padded frame whole. Its
-/// trailers' header block goes as [`HeaderBlockEncoding`] says.
+/// their lengths match, and its end goes in a frame of its own when the layout's did. A
+/// padded frame the peer's frame size or flow control can't take whole goes split, data
+/// first, its padding kept. Its trailers' header block goes as [`HeaderBlockEncoding`]
+/// says.
 pub trait BodyLayout: Send + Sync {
     /// Removes and returns the DATA frames it holds that went no later than the DATA
     /// frame carrying data at `through`, or every one given `None`.
@@ -794,9 +824,6 @@ struct RelayInner {
     /// The padding the client's streams received that the relaying peer isn't sent, by
     /// stream, which grows their windows here (see [`Relay::release_padding`]).
     released_padding: Vec<(u32, u32)>,
-    /// Whether the client sends more than the relaying peer takes (see
-    /// [`Relay::go_away_flooded`]).
-    flooded: bool,
     /// The octets of data the relaying peer was sent so far (see [`Relay::set_peer_sent`]).
     peer_sent: u64,
     /// Whether the connection ended.
@@ -847,14 +874,6 @@ impl Relay {
         }
         inner.ready = Some(cx.waker().clone());
         std::task::Poll::Pending
-    }
-
-    /// Ends the connection with a GOAWAY of ENHANCE_YOUR_CALM: the client sends frames
-    /// faster than the relaying peer takes them.
-    pub fn go_away_flooded(&self) {
-        let mut inner = self.lock();
-        inner.flooded = true;
-        inner.wake();
     }
 
     /// Grows the receive window of the client's stream `stream_id`, mirrored (see
@@ -953,12 +972,6 @@ impl Relay {
     /// since last asked (see [`Self::release_padding`]).
     pub(crate) fn take_released_padding(&self) -> Vec<(u32, u32)> {
         std::mem::take(&mut self.lock().released_padding)
-    }
-
-    /// Whether the client sends more than the relaying peer takes (see
-    /// [`Self::go_away_flooded`]).
-    pub(crate) fn is_flooded(&self) -> bool {
-        self.lock().flooded
     }
 
     /// Calls `hook` with each of the client's acknowledgements of the relayed frames from

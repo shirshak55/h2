@@ -518,6 +518,9 @@ where
         let span = tracing::trace_span!("FramedRead::poll_next");
         let _e = span.enter();
         loop {
+            if let Some(log) = &self.frame_log {
+                ready!(log.poll_gate(cx));
+            }
             tracing::trace!("poll");
             let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
                 Some(Ok(bytes)) => bytes,

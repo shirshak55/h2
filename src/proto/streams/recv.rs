@@ -22,6 +22,9 @@ pub(super) struct Recv {
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
 
+    /// The task waiting for room among the data received (see [`Recv::poll_buffered_room`]).
+    buffered_task: Option<Waker>,
+
     /// The lowest stream ID that is still idle
     next_stream_id: Result<StreamId, StreamIdOverflow>,
 
@@ -67,6 +70,11 @@ pub(super) struct Recv {
     /// [`Self::relayed_connection_increment`]).
     relay_repaid: u64,
 
+    /// Whether the WINDOW_UPDATEs due wait for a deferred preface, which no frame goes
+    /// ahead of: the windows they would grow may yet come to grow only by the relaying
+    /// peer's (see `Stream::mirror_window`).
+    pub windows_held: bool,
+
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
 }
@@ -91,6 +99,11 @@ pub(super) enum RecvHeaderBlockError<T> {
     State(Error),
 }
 
+/// How many octets of the data received a connection holds unreleased before it reads no
+/// more frames (see [`Recv::poll_buffered_room`]): relayed windows can be far larger, and a
+/// caller passing the data on to a peer slower to take it would otherwise hold all of it.
+const BUFFERED_DATA: WindowSize = 16 << 20;
+
 #[derive(Debug)]
 pub(crate) enum Open {
     PushPromise,
@@ -113,6 +126,7 @@ impl Recv {
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             flow,
             in_flight_data: 0 as WindowSize,
+            buffered_task: None,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
             last_processed_id: StreamId::ZERO,
@@ -126,6 +140,7 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             mirror_covered: 0,
             relay_repaid: 0,
+            windows_held: false,
         }
     }
 
@@ -458,6 +473,26 @@ impl Recv {
         Ok(())
     }
 
+    /// Ready once the data received and not yet released is less than [`BUFFERED_DATA`].
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        if self.in_flight_data < BUFFERED_DATA {
+            return Poll::Ready(());
+        }
+        self.buffered_task = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Counts `capacity` of the data received as released, waking the task waiting for room
+    /// among it.
+    fn release_in_flight(&mut self, capacity: WindowSize) {
+        self.in_flight_data -= capacity;
+        if self.in_flight_data < BUFFERED_DATA {
+            if let Some(task) = self.buffered_task.take() {
+                task.wake();
+            }
+        }
+    }
+
     /// Releases capacity of the connection
     pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
         tracing::trace!(
@@ -467,7 +502,7 @@ impl Recv {
         );
 
         // Decrement in-flight data
-        self.in_flight_data -= capacity;
+        self.release_in_flight(capacity);
 
         self.assign_connection_capacity(capacity, task);
     }
@@ -499,7 +534,7 @@ impl Recv {
 
         if stream.recv_flow.is_mirror() {
             // The relayed peer's WINDOW_UPDATEs grow the windows instead.
-            self.in_flight_data -= capacity;
+            self.release_in_flight(capacity);
             stream.in_flight_recv_data -= capacity;
             stream.mirror_unacked = stream.mirror_unacked.saturating_add(capacity);
             self.mirror_covered += u64::from(capacity);
@@ -510,6 +545,7 @@ impl Recv {
 
         // Decrement in-flight data
         stream.in_flight_recv_data -= capacity;
+        stream.unmirrored = stream.unmirrored.saturating_add(capacity);
 
         // Assign capacity to stream
         // TODO: proper error handling
@@ -586,6 +622,21 @@ impl Recv {
         }
 
         self.clear_recv_buffer(stream, task, counts);
+    }
+
+    /// Takes back the window the connection gave itself, as far as not yet announced, for
+    /// `octets` of data a client's stream released before it was mirrored (see
+    /// `Stream::mirror_window`), which the relaying peer was sent and so grants.
+    pub fn mirror_released(&mut self, octets: WindowSize) {
+        let unannounced = self
+            .flow
+            .available()
+            .as_size()
+            .saturating_sub(self.flow.window_size());
+        let cancelled = unannounced.min(octets);
+        let _res = self.flow.claim_capacity(cancelled);
+        debug_assert!(_res.is_ok());
+        self.mirror_covered += u64::from(cancelled);
     }
 
     /// The part of a relayed connection WINDOW_UPDATE's `increment` that grows the
@@ -877,7 +928,9 @@ impl Recv {
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
             // Padding the relaying peer isn't sent grows the windows here.
-            if stream.recv_flow.is_mirror() && !stream.relays_padding {
+            if !stream.recv_flow.is_mirror() {
+                stream.unmirrored_padding = stream.unmirrored_padding.saturating_add(padding);
+            } else if !stream.relays_padding {
                 self.release_mirrored_padding(padding, stream, &mut None);
             }
         }
@@ -1253,6 +1306,10 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        if self.windows_held {
+            return Ok(BufferStatus::Complete);
+        }
+
         // Send any pending connection level window updates
         if self.send_connection_window_update(dst)? == BufferStatus::CodecFull {
             return Ok(BufferStatus::CodecFull);

@@ -262,20 +262,13 @@ where
         Poll::Ready(Ok(()))
     }
 
-    /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
-    /// went out, and the acknowledgements due of the client's SETTINGS and PINGs no longer
-    /// awaiting relayed ones.
-    fn poll_relay(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+    /// Applies the relay's asks to mirror the client's streams' windows and to grow them by
+    /// padding (see `Relay::mirror_stream_window`, `Relay::release_padding`), ahead of the
+    /// WINDOW_UPDATEs due, so that none goes out for what the relaying peer grants.
+    fn apply_relayed_windows(&mut self) {
         let Some(relay) = &self.relay else {
-            return Poll::Ready(Ok(()));
+            return;
         };
-        let relays_acks = self.inner.set_forwarding(relay);
-        if relay.is_flooded() {
-            return Poll::Ready(Err(Error::library_go_away_data(
-                Reason::ENHANCE_YOUR_CALM,
-                "relayed_frames_backlog",
-            )));
-        }
         for (stream_id, relays_padding) in relay.take_all_mirrored() {
             self.inner
                 .streams
@@ -284,6 +277,16 @@ where
         for (stream_id, octets) in relay.take_released_padding() {
             self.inner.streams.release_padding(stream_id.into(), octets);
         }
+    }
+
+    /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
+    /// went out, and the acknowledgements due of the client's SETTINGS and PINGs no longer
+    /// awaiting relayed ones.
+    fn poll_relay(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let Some(relay) = &self.relay else {
+            return Poll::Ready(Ok(()));
+        };
+        let relays_acks = self.inner.set_forwarding(relay);
         if self.deferred_preface.is_some() {
             return Poll::Ready(Ok(()));
         }
@@ -630,8 +633,12 @@ where
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
+            self.apply_relayed_windows();
             ready!(self.poll_ready(cx))?;
             ready!(self.poll_relay(cx))?;
+            // No more frames while the data received waits to be taken (see
+            // `Recv::poll_buffered_room`).
+            ready!(self.inner.streams.poll_buffered_room(cx));
 
             let frame = ready!(Pin::new(&mut self.codec).poll_next(cx)?);
             if let (Some(relay), Some(Frame::Settings(_) | Frame::Ping(_))) = (&self.relay, &frame)

@@ -116,6 +116,12 @@ pub(super) struct Stream {
     /// by its WINDOW_UPDATEs, which then grow it by that too; else it grows by it here.
     pub relays_padding: bool,
 
+    /// Before the window grows only by relayed WINDOW_UPDATEs, the data released, and the
+    /// padding among it; after, what the window grew by here for the part the relaying
+    /// peer was sent, which those repay first (see [`Stream::mirror_window`]).
+    pub unmirrored: WindowSize,
+    pub unmirrored_padding: WindowSize,
+
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -223,6 +229,8 @@ impl Stream {
             in_flight_recv_data: 0,
             mirror_unacked: 0,
             relays_padding: false,
+            unmirrored: 0,
+            unmirrored_padding: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
@@ -234,6 +242,33 @@ impl Stream {
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
         }
+    }
+
+    /// Makes the receive window grow only by relayed WINDOW_UPDATEs (see
+    /// `FlowControl::set_mirror`), the relaying peer being sent the padding received if
+    /// `relays_padding`, and returns the data released before, which that peer was sent
+    /// (none once mirrored): what the window grew by here for it is taken back as far as
+    /// not yet announced.
+    pub fn mirror_window(&mut self, relays_padding: bool) -> WindowSize {
+        self.relays_padding = relays_padding;
+        if self.recv_flow.is_mirror() {
+            return 0;
+        }
+        self.recv_flow.set_mirror();
+        if !relays_padding {
+            self.unmirrored = self.unmirrored.saturating_sub(self.unmirrored_padding);
+        }
+        let sent = self.unmirrored;
+        let unannounced = self
+            .recv_flow
+            .available()
+            .as_size()
+            .saturating_sub(self.recv_flow.window_size());
+        let cancelled = unannounced.min(self.unmirrored);
+        let _res = self.recv_flow.claim_capacity(cancelled);
+        debug_assert!(_res.is_ok());
+        self.unmirrored -= cancelled;
+        sent
     }
 
     /// Increment the stream's ref count

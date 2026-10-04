@@ -127,17 +127,19 @@ where
     }
 
     /// Relays another connection's peer's frames through `relay`, which may make the
-    /// remote's streams' windows grow only by relayed WINDOW_UPDATEs.
+    /// remote's streams' windows grow only by relayed WINDOW_UPDATEs, after a deferred
+    /// preface, which the WINDOW_UPDATEs due wait for (see `Self::apply_preface`).
     pub fn set_relay(&mut self, relay: Relay) {
         let mut me = self.inner.lock().unwrap();
         me.relay = Some(relay);
+        me.actions.recv.windows_held = true;
         me.actions.send.flush_user_resets();
     }
 
     /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
     /// (`window`, its increment) written ahead of every other frame: the remote may open
-    /// as many streams as it says, and the extended CONNECT it enables, and the connection
-    /// window grew by the increment.
+    /// as many streams as it says, and the extended CONNECT it enables, the connection
+    /// window grew by the increment, and the WINDOW_UPDATEs due go out after it.
     pub fn apply_preface(
         &mut self,
         frame: &frame::Settings,
@@ -145,6 +147,7 @@ where
     ) -> Result<(), Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
+        me.actions.recv.windows_held = false;
         if let Some(max) = frame.max_concurrent_streams() {
             me.counts.set_max_recv_streams(max as usize);
         }
@@ -181,7 +184,12 @@ where
         }
         match me.store.find_mut(&id) {
             Some(mut stream) if !stream.state.is_closed() => {
-                stream.recv_flow.set_mirror();
+                let relays_padding = stream.relays_padding;
+                let sent = stream.mirror_window(relays_padding);
+                me.actions.recv.mirror_released(sent);
+                let repaid = increment.min(stream.unmirrored);
+                stream.unmirrored -= repaid;
+                let increment = increment - repaid;
                 stream.mirror_unacked = stream.mirror_unacked.saturating_sub(increment);
                 stream
                     .recv_flow
@@ -197,9 +205,10 @@ where
     /// `Relay::mirror_stream_window`).
     pub fn mirror_stream_window(&mut self, id: StreamId, relays_padding: bool) {
         let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
         if let Some(mut stream) = me.store.find_mut(&id) {
-            stream.recv_flow.set_mirror();
-            stream.relays_padding = relays_padding;
+            let sent = stream.mirror_window(relays_padding);
+            me.actions.recv.mirror_released(sent);
         }
     }
 
@@ -286,6 +295,13 @@ where
                 BufferStatus::CodecFull => ready!(dst.poll_ready(cx))?,
             }
         }
+    }
+
+    /// Ready once the data received and not yet released leaves room for more: the
+    /// connection reads no more frames meanwhile.
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.inner.lock().unwrap();
+        me.actions.recv.poll_buffered_room(cx)
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -638,13 +654,12 @@ impl Inner {
 
     /// Makes `stream`'s window grow only by relayed WINDOW_UPDATEs, if asked to since
     /// last checked (see `Relay::mirror_stream_window`).
-    fn mirror_if_asked(relay: &Option<Relay>, stream: &mut Stream) {
+    fn mirror_if_asked(relay: &Option<Relay>, recv: &mut Recv, stream: &mut Stream) {
         if let Some(relays_padding) = relay
             .as_ref()
             .and_then(|relay| relay.take_mirrored(stream.id.into()))
         {
-            stream.recv_flow.set_mirror();
-            stream.relays_padding = relays_padding;
+            recv.mirror_released(stream.mirror_window(relays_padding));
         }
     }
 
@@ -819,7 +834,7 @@ impl Inner {
         };
 
         let mut stream = stream;
-        Inner::mirror_if_asked(&self.relay, &mut stream);
+        Inner::mirror_if_asked(&self.relay, &mut self.actions.recv, &mut stream);
         let actions = &mut self.actions;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
@@ -1862,7 +1877,7 @@ impl OpaqueStreamRef {
         let me = &mut *me;
 
         let mut stream = me.store.resolve(self.key);
-        Inner::mirror_if_asked(&me.relay, &mut stream);
+        Inner::mirror_if_asked(&me.relay, &mut me.actions.recv, &mut stream);
 
         me.actions
             .recv
