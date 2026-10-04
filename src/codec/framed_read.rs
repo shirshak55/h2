@@ -346,6 +346,10 @@ fn decode_frame(
                 }
             }
 
+            if let Continuable::Headers(headers) = &mut partial.frame {
+                headers.push_fragment(bytes.len() - frame::HEADER_LEN);
+            }
+
             // Extend the buf
             if partial.buf.is_empty() {
                 partial.buf = bytes.split_off(frame::HEADER_LEN);
@@ -445,6 +449,7 @@ fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
                 priority: f.stream_dep().map(|dep| dep.to_ext()),
                 pseudo_order: f.pseudo_order().to_vec(),
                 never_indexed: f.never_indexed().to_vec(),
+                encoding: f.take_encoding(),
                 connection: log.clone(),
             };
             let logged = LoggedFrame::Headers {

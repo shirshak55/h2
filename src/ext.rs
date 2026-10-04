@@ -286,8 +286,66 @@ pub struct HeadersFrame {
     /// Its pseudo-header fields sent as never-indexed literals, which an intermediary
     /// sends so too (RFC 7541 §6.2.3); its fields' values are marked sensitive.
     pub never_indexed: Vec<PseudoHeader>,
+    /// How its header block went.
+    pub encoding: HeaderBlockEncoding,
     /// The frames its connection's peer sent.
     pub connection: FrameLog,
+}
+
+/// How a header block went on the wire: its HPACK dynamic table size updates and each
+/// field's representation (RFC 7541), and how its HEADERS frame and the CONTINUATION
+/// frames after it carried it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HeaderBlockEncoding {
+    /// The dynamic table size updates at its start, in order (RFC 7541 §6.3).
+    pub size_updates: Vec<usize>,
+    /// Its fields in block order, pseudo-header fields first.
+    pub fields: Vec<EncodedField>,
+    /// The HEADERS frame's pad length, when it carried the PADDED flag.
+    pub padding: Option<u8>,
+    /// The lengths of the block's fragments: the HEADERS frame's, then each
+    /// CONTINUATION frame's.
+    pub fragments: Vec<usize>,
+}
+
+/// A header field as a header block carried it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EncodedField {
+    /// Its name, a pseudo-header field's with its colon.
+    pub name: Bytes,
+    /// Its value.
+    pub value: Bytes,
+    /// How it went.
+    pub representation: FieldRepresentation,
+}
+
+/// How a header field went in an HPACK header block (RFC 7541 §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldRepresentation {
+    /// By the index of its static or dynamic table entry (§6.1).
+    Indexed(usize),
+    /// As a literal (§6.2).
+    Literal {
+        /// Whether, and how, it enters the dynamic table.
+        indexing: LiteralIndexing,
+        /// The index of the table entry naming it, or `None` for a literal name.
+        name_index: Option<usize>,
+        /// Whether its literal name is Huffman-coded.
+        name_huffman: bool,
+        /// Whether its value is Huffman-coded.
+        value_huffman: bool,
+    },
+}
+
+/// How a literal header field touches the HPACK dynamic table (RFC 7541 §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LiteralIndexing {
+    /// It enters the table (§6.2.1).
+    Incremental,
+    /// It doesn't (§6.2.2).
+    Without,
+    /// It doesn't, nor may an intermediary encoding it again add it (§6.2.3).
+    Never,
 }
 
 /// A frame of a server's connection preface a [`DeferredPreface`] supplies: its SETTINGS,

@@ -1,12 +1,15 @@
 use super::{util, StreamDependency, StreamId};
-use crate::ext::{HeaderOrder, HeadersFrame, Protocol, PseudoHeader};
+use crate::ext::{
+    EncodedField, FieldRepresentation, HeaderBlockEncoding, HeaderOrder, HeadersFrame, Protocol,
+    PseudoHeader,
+};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -104,6 +107,9 @@ struct HeaderBlock {
     /// How the frame was received, for a connection recording its peer's frames
     received: Option<Box<HeadersFrame>>,
 
+    /// How the block went on the wire, as decoded
+    encoding: HeaderBlockEncoding,
+
     /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
 
@@ -153,6 +159,7 @@ impl Headers {
                 pseudo_order: Vec::new(),
                 never_indexed: Vec::new(),
                 received: None,
+                encoding: HeaderBlockEncoding::default(),
                 is_over_size: false,
                 pseudo,
             },
@@ -174,6 +181,7 @@ impl Headers {
                 pseudo_order: Vec::new(),
                 never_indexed: Vec::new(),
                 received: None,
+                encoding: HeaderBlockEncoding::default(),
                 is_over_size: false,
                 pseudo: Pseudo::default(),
             },
@@ -242,6 +250,11 @@ impl Headers {
                 pseudo_order: Vec::new(),
                 never_indexed: Vec::new(),
                 received: None,
+                encoding: HeaderBlockEncoding {
+                    padding: flags.is_padded().then_some(pad as u8),
+                    fragments: vec![src.len()],
+                    ..HeaderBlockEncoding::default()
+                },
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -320,6 +333,16 @@ impl Headers {
 
     pub(crate) fn take_received(&mut self) -> Option<HeadersFrame> {
         self.header_block.received.take().map(|received| *received)
+    }
+
+    /// Notes a CONTINUATION frame's fragment of `len` octets of the block.
+    pub(crate) fn push_fragment(&mut self, len: usize) {
+        self.header_block.encoding.fragments.push(len);
+    }
+
+    /// Takes how the block went on the wire.
+    pub(crate) fn take_encoding(&mut self) -> HeaderBlockEncoding {
+        std::mem::take(&mut self.header_block.encoding)
     }
 
     #[cfg(feature = "unstable")]
@@ -440,6 +463,7 @@ impl PushPromise {
                 pseudo_order: Vec::new(),
                 never_indexed: Vec::new(),
                 received: None,
+                encoding: HeaderBlockEncoding::default(),
                 is_over_size: false,
                 pseudo,
             },
@@ -534,6 +558,7 @@ impl PushPromise {
                 pseudo_order: Vec::new(),
                 never_indexed: Vec::new(),
                 received: None,
+                encoding: HeaderBlockEncoding::default(),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -998,8 +1023,25 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header, never_indexed| {
+        let res = decoder.decode(&mut cursor, |header, representation| {
             use crate::hpack::Header::*;
+
+            use crate::ext::LiteralIndexing;
+
+            let never_indexed = matches!(
+                representation,
+                FieldRepresentation::Literal {
+                    indexing: LiteralIndexing::Never,
+                    ..
+                }
+            );
+            if !self.is_over_size {
+                self.encoding.fields.push(EncodedField {
+                    name: Bytes::copy_from_slice(header.name().as_slice()),
+                    value: Bytes::copy_from_slice(header.value_slice()),
+                    representation,
+                });
+            }
 
             match header {
                 Field { name, value } => {
@@ -1051,6 +1093,10 @@ impl HeaderBlock {
 
             ControlFlow::Continue(())
         });
+
+        self.encoding
+            .size_updates
+            .extend(decoder.take_size_updates());
 
         match res {
             Ok(()) => {}
