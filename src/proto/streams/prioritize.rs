@@ -169,8 +169,8 @@ impl Prioritize {
             }
         }
 
-        // Update the buffered data counter
-        stream.buffered_send_data += sz as usize;
+        // Update the buffered data counter, its padding counting as it does
+        stream.buffered_send_data += sz as usize + frame.planned_padding_len();
 
         let span =
             tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
@@ -335,6 +335,24 @@ impl Prioritize {
             debug_assert!(_res.is_ok());
             // Re-assign all capacity to the connection
             self.assign_connection_capacity(available, stream, counts);
+        }
+    }
+
+    /// Takes the `padding_len` bytes a DATA frame's padding counted for off the stream's
+    /// buffered data, once it goes unpadded, and gives the connection back the capacity
+    /// assigned for them.
+    fn drop_padding(&mut self, padding_len: usize, stream: &mut store::Ptr, counts: &mut Counts) {
+        stream.buffered_send_data -= padding_len;
+        stream.requested_send_capacity = stream
+            .requested_send_capacity
+            .saturating_sub(padding_len as WindowSize);
+        let available = stream.send_flow.available().as_size();
+        if available > stream.requested_send_capacity {
+            let excess = available - stream.requested_send_capacity;
+            // TODO: proper error handling
+            let _res = stream.send_flow.claim_capacity(excess);
+            debug_assert!(_res.is_ok());
+            self.assign_connection_capacity(excess, stream, counts);
         }
     }
 
@@ -631,7 +649,7 @@ impl Prioritize {
             prioritized.inner.into_inner()
         });
 
-        if frame.payload().has_remaining() {
+        if frame.payload().has_remaining() || !frame.plan_mut().is_empty() {
             let mut stream = store.resolve(key);
 
             if eos {
@@ -783,7 +801,28 @@ impl Prioritize {
                             // Get the amount of capacity remaining for stream's
                             // window.
                             let stream_capacity = stream.send_flow.available();
-                            let sz = frame.payload().remaining();
+
+                            // The frame it goes as next, when laid out (see
+                            // `Data::plan_mut`): an empty one carries none of it.
+                            let planned = frame.plan_mut().front().copied();
+                            let sz = match planned {
+                                Some(planned) if !planned.data => 0,
+                                _ => frame.payload().remaining(),
+                            };
+
+                            // A padded frame goes whole, else unpadded.
+                            let mut padding = planned.and_then(|planned| planned.padding);
+                            let padded_len = sz + padding.map_or(0, |pad| usize::from(pad) + 1);
+                            if padding.is_some()
+                                && (padded_len > max_len
+                                    || padded_len > stream_capacity.as_size() as usize
+                                    || padded_len > stream.send_flow.window_size() as usize)
+                            {
+                                self.drop_padding(padded_len - sz, &mut stream, counts);
+                                frame.plan_mut()[0].padding = None;
+                                padding = None;
+                            }
+                            let padding_len = padding.map_or(0, |pad| WindowSize::from(pad) + 1);
 
                             tracing::trace!(
                                 sz,
@@ -822,36 +861,39 @@ impl Prioritize {
                             let len =
                                 cmp::min(len, stream_capacity.as_size() as usize) as WindowSize;
 
+                            // The window its padding takes too
+                            let flow_len = len + padding_len;
+
                             // There *must* be be enough connection level
                             // capacity at this point.
-                            debug_assert!(len <= self.flow.window_size());
+                            debug_assert!(flow_len <= self.flow.window_size());
 
                             // Check if the stream level window the peer knows is available. In some
                             // scenarios, maybe the window we know is available but the window which
                             // peer knows is not.
-                            if len > 0 && len > stream.send_flow.window_size() {
+                            if flow_len > 0 && flow_len > stream.send_flow.window_size() {
                                 stream.pending_send.push_front(buffer, frame.into());
                                 continue;
                             }
 
-                            tracing::trace!(len, "sending data frame");
+                            tracing::trace!(len, padding_len, "sending data frame");
 
                             // Update the flow control
                             tracing::trace_span!("updating stream flow").in_scope(|| {
-                                stream.send_data(len, self.max_buffer_size);
+                                stream.send_data(flow_len, self.max_buffer_size);
 
                                 // Assign the capacity back to the connection that
                                 // was just consumed from the stream in the previous
                                 // line.
                                 // TODO: proper error handling
-                                let _res = self.flow.assign_capacity(len);
+                                let _res = self.flow.assign_capacity(flow_len);
                                 debug_assert!(_res.is_ok());
                             });
 
                             let (eos, len) = tracing::trace_span!("updating connection flow")
                                 .in_scope(|| {
                                     // TODO: proper error handling
-                                    let _res = self.flow.send_data(len);
+                                    let _res = self.flow.send_data(flow_len);
                                     debug_assert!(_res.is_ok());
 
                                     // Wrap the frame's data payload to ensure that the
@@ -860,9 +902,16 @@ impl Prioritize {
                                     let eos = frame.is_end_stream();
                                     let len = len as usize;
 
-                                    if frame.payload().remaining() > len {
+                                    // The planned frame went once it carried its data.
+                                    if planned.is_some() && len == sz {
+                                        frame.plan_mut().pop_front();
+                                    }
+                                    if frame.payload().remaining() > len
+                                        || !frame.plan_mut().is_empty()
+                                    {
                                         frame.set_end_stream(false);
                                     }
+                                    frame.set_padding(padding);
                                     (eos, len)
                                 });
 

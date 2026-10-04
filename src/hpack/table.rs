@@ -1,3 +1,4 @@
+use super::decoder::get_static;
 use super::Header;
 
 use fnv::FnvHasher;
@@ -154,10 +155,78 @@ impl Table {
             return Index::new(statik, header);
         }
 
-        self.index_dynamic(header, statik)
+        self.index_dynamic(header, statik, false)
     }
 
-    fn index_dynamic(&mut self, header: Header, statik: Option<(usize, bool)>) -> Index {
+    /// The entry at `index` (RFC 7541 §2.3.3), when the table holds one.
+    fn entry(&self, index: usize) -> Option<Header> {
+        match index {
+            0 => None,
+            1..=61 => Some(get_static(index)),
+            _ => self
+                .slots
+                .get(index - DYN_OFFSET)
+                .map(|slot| slot.header.clone()),
+        }
+    }
+
+    /// The index of an entry equal to `header`: `preferred` when that one is, else the
+    /// static table's, else the newest in the dynamic table.
+    pub fn find(&self, header: &Header, preferred: usize) -> Option<usize> {
+        let equal = |entry: &Header| entry.name() == header.name() && entry.value_eq(header);
+        if self.entry(preferred).map_or(false, |entry| equal(&entry)) {
+            return Some(preferred);
+        }
+        if let Some((index, true)) = index_static(header) {
+            return Some(index);
+        }
+        self.slots
+            .iter()
+            .position(|slot| equal(&slot.header))
+            .map(|at| at + DYN_OFFSET)
+    }
+
+    /// The index of an entry naming `header`: `preferred` when that one does, else the
+    /// static table's, else the newest in the dynamic table.
+    pub fn find_name(&self, header: &Header, preferred: Option<usize>) -> Option<usize> {
+        if let Some(preferred) = preferred {
+            if self
+                .entry(preferred)
+                .map_or(false, |entry| entry.name() == header.name())
+            {
+                return Some(preferred);
+            }
+        }
+        if let Some((index, _)) = index_static(header) {
+            return Some(index);
+        }
+        self.slots
+            .iter()
+            .position(|slot| slot.header.name() == header.name())
+            .map(|at| at + DYN_OFFSET)
+    }
+
+    /// Adds `header` to the dynamic table as a literal with incremental indexing does,
+    /// whether or not an equal entry is in it; one larger than the table empties it (RFC
+    /// 7541 §4.4).
+    pub fn insert_entry(&mut self, header: Header) {
+        if header.len() > self.max_size {
+            let max_size = self.max_size;
+            self.resize(0);
+            self.max_size = max_size;
+        } else {
+            self.index_dynamic(header, None, true);
+        }
+    }
+
+    /// Indexes `header` in the dynamic table, adding it, unless an equal entry is in it and
+    /// `force` isn't set.
+    fn index_dynamic(
+        &mut self,
+        header: Header,
+        statik: Option<(usize, bool)>,
+        force: bool,
+    ) -> Index {
         debug_assert!(self.assert_valid_state("one"));
 
         if header.len() + self.size < self.max_size || !header.is_sensitive() {
@@ -192,7 +261,13 @@ impl Table {
                     return self.index_vacant(header, hash, dist, probe, statik);
                 } else if pos.hash == hash && self.slots[slot_idx].header.name() == header.name() {
                     // Matching name, check values
-                    return self.index_occupied(header, hash, pos.index, statik.map(|(n, _)| n));
+                    return self.index_occupied(
+                        header,
+                        hash,
+                        pos.index,
+                        statik.map(|(n, _)| n),
+                        force,
+                    );
                 }
             } else {
                 return self.index_vacant(header, hash, dist, probe, statik);
@@ -208,6 +283,7 @@ impl Table {
         hash: HashValue,
         mut index: usize,
         statik: Option<usize>,
+        force: bool,
     ) -> Index {
         debug_assert!(self.assert_valid_state("top"));
 
@@ -218,7 +294,7 @@ impl Table {
             // Compute the real index into the VecDeque
             let real_idx = index.wrapping_add(self.inserted);
 
-            if self.slots[real_idx].header.value_eq(&header) {
+            if !force && self.slots[real_idx].header.value_eq(&header) {
                 // We have a full match!
                 return Index::Indexed(real_idx + DYN_OFFSET, header);
             }
@@ -674,7 +750,7 @@ fn hash_header(header: &Header) -> HashValue {
 
 /// Checks the static table for the header. If found, returns the index and a
 /// boolean representing if the value matched as well.
-fn index_static(header: &Header) -> Option<(usize, bool)> {
+pub(super) fn index_static(header: &Header) -> Option<(usize, bool)> {
     match *header {
         Header::Field {
             ref name,

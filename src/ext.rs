@@ -321,6 +321,15 @@ pub struct HeadersFrame {
 /// How a header block went on the wire: its HPACK dynamic table size updates and each
 /// field's representation (RFC 7541), and how its HEADERS frame and the CONTINUATION
 /// frames after it carried it.
+///
+/// A response sent with one has its header block encoded as it says, as far as the
+/// connection's own table allows: each field takes the representation of the first field
+/// it lists by that name and value not taken yet, else by that name, and a representation
+/// naming a table entry the connection's table doesn't hold at that index names one that
+/// does, or goes as a literal entering the table; fields it doesn't list, and size updates
+/// above the peer's limit, go as the connection would send them, and a sensitive field
+/// goes never indexed. The HEADERS frame takes its padding, and the fragments their
+/// lengths, as far as the block and the peer's frame size allow.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HeaderBlockEncoding {
     /// The dynamic table size updates at its start, in order (RFC 7541 §6.3).
@@ -449,6 +458,34 @@ impl BodyFrames {
     /// Takes how the trailers' header block went, once it arrived.
     pub fn take_trailers(&self) -> Option<HeaderBlockEncoding> {
         self.lock().trailers.take()
+    }
+}
+
+/// How a body goes on the wire past its header block, as another connection received
+/// it: its DATA frames that carried padding or no data or ended the stream, and how its
+/// trailers' header block went.
+///
+/// A response sent with a [`SendBodyLayout`] goes so: ahead of each chunk of its body go
+/// the empty DATA frames the layout has there, the chunk takes its frame's padding when
+/// their lengths match, and its end goes in a frame of its own when the layout's did, as
+/// far as the peer's frame size and flow control allow a padded frame whole. Its
+/// trailers' header block goes as [`HeaderBlockEncoding`] says.
+pub trait BodyLayout: Send + Sync {
+    /// Removes and returns the DATA frames it holds that went no later than the DATA
+    /// frame carrying data at `through`, or every one given `None`.
+    fn take(&self, through: Option<u64>) -> Vec<DataFrame>;
+
+    /// Takes how the trailers' header block went, once it arrived.
+    fn take_trailers(&self) -> Option<HeaderBlockEncoding>;
+}
+
+/// A response extension sending its body as a [`BodyLayout`] says.
+#[derive(Clone)]
+pub struct SendBodyLayout(pub Arc<dyn BodyLayout>);
+
+impl fmt::Debug for SendBodyLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("SendBodyLayout(..)")
     }
 }
 

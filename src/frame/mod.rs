@@ -49,6 +49,7 @@ mod util;
 mod window_update;
 
 pub use self::data::Data;
+pub(crate) use self::data::PlannedFrame;
 pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
 pub use self::headers::{

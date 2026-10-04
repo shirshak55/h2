@@ -265,11 +265,11 @@ where
                 // Ensure that the payload is not greater than the max frame.
                 let len = v.payload().remaining();
 
-                if len > self.max_frame_size() {
+                if len + v.padding_len() > self.max_frame_size() {
                     return Err(PayloadTooBig);
                 }
 
-                if len >= self.chain_threshold {
+                if len >= self.chain_threshold && v.padding_len() == 0 {
                     let head = v.head();
 
                     // Encode the frame head to the buffer

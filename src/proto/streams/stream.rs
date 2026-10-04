@@ -77,6 +77,14 @@ pub(super) struct Stream {
     /// Set to true when a push is pending for this stream
     pub is_pending_push: bool,
 
+    /// How its body goes, when as another connection received one (see
+    /// `ext::SendBodyLayout`)
+    pub body_layout: Option<std::sync::Arc<dyn crate::ext::BodyLayout>>,
+
+    /// How many chunks carrying data its body went in so far, when `body_layout` lays it
+    /// out
+    pub body_chunks: u64,
+
     // ===== Fields related to receiving =====
     /// Next node in the accept linked list
     pub next_pending_accept: Option<store::Key>,
@@ -183,6 +191,8 @@ impl Stream {
             is_pending_open: false,
             next_open: None,
             is_pending_push: false,
+            body_layout: None,
+            body_chunks: 0,
 
             // ===== Fields related to receiving =====
             next_pending_accept: None,

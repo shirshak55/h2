@@ -2,7 +2,7 @@ use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{HeaderOrder, Protocol};
+use crate::ext::{BodyLayout, HeaderBlockEncoding, HeaderOrder, Protocol, SendBodyLayout};
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
@@ -12,8 +12,9 @@ use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::{fmt, io};
+use std::{cmp, fmt, io};
 
 #[derive(Debug)]
 pub(crate) struct Streams<B, P>
@@ -1239,6 +1240,47 @@ where
 
 // ===== impl StreamRef =====
 
+/// The frames a body's chunk of `len` bytes goes as, after `index` chunks carrying data,
+/// as `layout` says (see [`SendBodyLayout`]); empty for one frame carrying it unpadded.
+fn plan_data(
+    layout: &dyn BodyLayout,
+    index: u64,
+    len: usize,
+    end_stream: bool,
+) -> VecDeque<frame::PlannedFrame> {
+    let empty = |padding| frame::PlannedFrame {
+        data: false,
+        padding,
+    };
+    let mut before = VecDeque::new();
+    let mut padding = None;
+    let mut after = Vec::new();
+    for received in layout.take((!end_stream).then_some(index)) {
+        match (received.len, received.index.cmp(&index)) {
+            (0, cmp::Ordering::Equal) if len == 0 && received.end_stream => {
+                padding = received.padding
+            }
+            (0, cmp::Ordering::Equal) if !received.end_stream => {
+                before.push_back(empty(received.padding))
+            }
+            (0, cmp::Ordering::Greater) if len > 0 => after.push(empty(received.padding)),
+            (received_len, cmp::Ordering::Equal) if received_len == len && len > 0 => {
+                padding = received.padding
+            }
+            _ => {}
+        }
+    }
+    if before.is_empty() && padding.is_none() && after.is_empty() {
+        return before;
+    }
+    before.push_back(frame::PlannedFrame {
+        data: true,
+        padding,
+    });
+    before.extend(after);
+    before
+}
+
 impl<B> StreamRef<B> {
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
@@ -1256,6 +1298,13 @@ impl<B> StreamRef<B> {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
+            if let Some(layout) = &stream.body_layout {
+                let len = frame.payload().remaining();
+                *frame.plan_mut() = plan_data(&**layout, stream.body_chunks, len, end_stream);
+                if len > 0 {
+                    stream.body_chunks += 1;
+                }
+            }
 
             // Send the data frame
             actions
@@ -1281,6 +1330,13 @@ impl<B> StreamRef<B> {
             // Create the trailers frame
             let mut frame = frame::Headers::trailers(stream.id, trailers);
             frame.set_header_order(order);
+            if let Some(encoding) = stream
+                .body_layout
+                .as_ref()
+                .and_then(|layout| layout.take_trailers())
+            {
+                frame.set_encoding(encoding);
+            }
 
             // Send the trailers frame
             actions
@@ -1356,6 +1412,8 @@ impl<B> StreamRef<B> {
         end_of_stream: bool,
     ) -> Result<(), UserError> {
         let order = response.extensions_mut().remove::<HeaderOrder>();
+        let encoding = response.extensions_mut().remove::<HeaderBlockEncoding>();
+        let body_layout = response.extensions_mut().remove::<SendBodyLayout>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1367,8 +1425,12 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame =
+            let mut frame =
                 server::Peer::convert_send_message(stream.id, response, order, end_of_stream);
+            if let Some(encoding) = encoding {
+                frame.set_encoding(encoding);
+            }
+            stream.body_layout = body_layout.map(|layout| layout.0);
 
             actions
                 .send

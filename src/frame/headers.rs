@@ -11,7 +11,7 @@ use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -110,6 +110,10 @@ struct HeaderBlock {
     /// How the block went on the wire, as decoded
     encoding: HeaderBlockEncoding,
 
+    /// How to encode it, when as a block another connection received went (see
+    /// [`HeaderBlockEncoding`])
+    send_as: Option<Box<HeaderBlockEncoding>>,
+
     /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
 
@@ -136,6 +140,10 @@ impl Eq for HeaderBlock {}
 #[derive(Debug)]
 struct EncodingHeaderBlock {
     hpack: BytesMut,
+    /// The HEADERS frame's pad length, to pad it with.
+    padding: Option<u8>,
+    /// The lengths of the fragments still to send, the room in each frame aside.
+    fragments: VecDeque<usize>,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -160,6 +168,7 @@ impl Headers {
                 never_indexed: Vec::new(),
                 received: None,
                 encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -182,6 +191,7 @@ impl Headers {
                 never_indexed: Vec::new(),
                 received: None,
                 encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
             },
@@ -255,6 +265,7 @@ impl Headers {
                     fragments: vec![src.len()],
                     ..HeaderBlockEncoding::default()
                 },
+                send_as: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -345,6 +356,11 @@ impl Headers {
         std::mem::take(&mut self.header_block.encoding)
     }
 
+    /// Encodes the block, and lays it out in frames, as `encoding` says.
+    pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
+        self.header_block.send_as = Some(Box::new(encoding));
+    }
+
     #[cfg(feature = "unstable")]
     pub fn pseudo_mut(&mut self) -> &mut Pseudo {
         &mut self.header_block.pseudo
@@ -378,9 +394,9 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |_| {})
+        let mut encoding = self.header_block.into_encoding(encoder);
+        let padding = encoding.padding.take();
+        encoding.encode(&head, dst, Some(encoder), padding, |_| {})
     }
 
     fn head(&self) -> Head {
@@ -464,6 +480,7 @@ impl PushPromise {
                 never_indexed: Vec::new(),
                 received: None,
                 encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -559,6 +576,7 @@ impl PushPromise {
                 never_indexed: Vec::new(),
                 received: None,
                 encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -611,7 +629,7 @@ impl PushPromise {
 
         self.header_block
             .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |dst| {
+            .encode(&head, dst, Some(encoder), None, |dst| {
                 dst.put_u32(promised_id.into());
             })
     }
@@ -654,7 +672,7 @@ impl Continuation {
         // Get the CONTINUATION frame head
         let head = self.head();
 
-        self.header_block.encode(&head, dst, None, |_| {})
+        self.header_block.encode(&head, dst, None, None, |_| {})
     }
 }
 
@@ -750,11 +768,14 @@ impl Pseudo {
 // ===== impl EncodingHeaderBlock =====
 
 impl EncodingHeaderBlock {
+    /// Encodes a frame of `head` carrying the next fragment, padded by `padding` when the
+    /// frame has room for it, `f` writing what comes before the fragment.
     fn encode<F>(
         mut self,
         head: &Head,
         dst: &mut EncodeBuf<'_>,
         encoder: Option<&mut hpack::Encoder>,
+        padding: Option<u8>,
         f: F,
     ) -> Option<Continuation>
     where
@@ -769,11 +790,21 @@ impl EncodingHeaderBlock {
 
         let payload_pos = dst.get_ref().len();
 
+        // Its length octet, then the padding, take room the fragment then lacks.
+        let padding = padding.filter(|&pad| usize::from(pad) < dst.remaining_mut());
+        if let Some(pad) = padding {
+            dst.put_u8(pad);
+            dst.get_mut()[head_pos + 4] |= PADDED;
+        }
+        let pad = padding.map_or(0, usize::from);
+
         f(dst);
 
         // Now, encode the header payload
-        let continuation = if self.hpack.len() > dst.remaining_mut() {
-            let head_part = self.hpack.split_to(dst.remaining_mut());
+        let room = dst.remaining_mut() - pad;
+        let len = self.fragments.pop_front().map_or(room, |len| len.min(room));
+        let continuation = if self.hpack.len() > len {
+            let head_part = self.hpack.split_to(len);
             dst.put_slice(&head_part);
 
             Some(Continuation {
@@ -790,6 +821,7 @@ impl EncodingHeaderBlock {
 
             None
         };
+        dst.put_bytes(0, pad);
 
         // Compute the header block length
         let payload_len = (dst.get_ref().len() - payload_pos) as u64;
@@ -1142,9 +1174,24 @@ impl HeaderBlock {
         }
         .chain(ordered);
 
-        encoder.encode(headers, &mut hpack);
-
-        EncodingHeaderBlock { hpack }
+        match self.send_as {
+            Some(encoding) => {
+                encoder.encode_as(headers, &encoding, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack,
+                    padding: encoding.padding,
+                    fragments: encoding.fragments.into(),
+                }
+            }
+            None => {
+                encoder.encode(headers, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack,
+                    padding: None,
+                    fragments: VecDeque::new(),
+                }
+            }
+        }
     }
 
     /// Calculates the size of the currently decoded header list.
