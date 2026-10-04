@@ -1092,13 +1092,13 @@ impl HeaderBlock {
                     ..
                 }
             );
-            if !self.is_over_size {
-                self.encoding.fields.push(EncodedField {
-                    name: Bytes::copy_from_slice(header.name().as_slice()),
-                    value: Bytes::copy_from_slice(header.value_slice()),
-                    representation,
-                });
-            }
+            // Recorded once known well-formed and within the list size, which charges it,
+            // so that a malformed block's fields, which it doesn't, take no memory.
+            let recorded = (!self.is_over_size && !malformed).then(|| EncodedField {
+                name: Bytes::copy_from_slice(header.name().as_slice()),
+                value: Bytes::copy_from_slice(header.value_slice()),
+                representation,
+            });
 
             match header {
                 Field { name, value } => {
@@ -1146,6 +1146,10 @@ impl HeaderBlock {
                 Path(v) => set_pseudo!(path, Path, v, never_indexed),
                 Protocol(v) => set_pseudo!(protocol, Protocol, v, never_indexed),
                 Status(v) => set_pseudo!(status, Status, v, never_indexed),
+            }
+
+            if let Some(field) = recorded.filter(|_| !malformed && !self.is_over_size) {
+                self.encoding.fields.push(field);
             }
 
             ControlFlow::Continue(())
