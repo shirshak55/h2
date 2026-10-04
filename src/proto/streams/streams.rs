@@ -2,7 +2,9 @@ use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{BodyLayout, HeaderBlockEncoding, HeaderOrder, Protocol, SendBodyLayout};
+use crate::ext::{
+    BodyLayout, DataFrame, HeaderBlockEncoding, HeaderOrder, Protocol, SendBodyLayout,
+};
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
@@ -14,7 +16,7 @@ use tokio::io::AsyncWrite;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::{cmp, fmt, io};
+use std::{fmt, io};
 
 #[derive(Debug)]
 pub(crate) struct Streams<B, P>
@@ -1241,44 +1243,59 @@ where
 // ===== impl StreamRef =====
 
 /// The frames a body's chunk of `len` bytes goes as, after `index` chunks carrying data,
-/// as `layout` says (see [`SendBodyLayout`]); empty for one frame carrying it unpadded.
+/// as the DATA frames `layout` tells, held in `pending` until their chunk comes (see
+/// [`SendBodyLayout`]); empty for one frame carrying it unpadded.
 fn plan_data(
     layout: &dyn BodyLayout,
+    pending: &mut VecDeque<DataFrame>,
     index: u64,
     len: usize,
     end_stream: bool,
 ) -> VecDeque<frame::PlannedFrame> {
-    let empty = |padding| frame::PlannedFrame {
-        data: false,
-        padding,
+    let planned = |data, received: DataFrame| frame::PlannedFrame {
+        data,
+        padding: received.padding,
     };
-    let mut before = VecDeque::new();
-    let mut padding = None;
-    let mut after = Vec::new();
-    for received in layout.take((!end_stream).then_some(index)) {
-        match (received.len, received.index.cmp(&index)) {
-            (0, cmp::Ordering::Equal) if len == 0 && received.end_stream => {
-                padding = received.padding
-            }
-            (0, cmp::Ordering::Equal) if !received.end_stream => {
-                before.push_back(empty(received.padding))
-            }
-            (0, cmp::Ordering::Greater) if len > 0 => after.push(empty(received.padding)),
-            (received_len, cmp::Ordering::Equal) if received_len == len && len > 0 => {
-                padding = received.padding
-            }
-            _ => {}
+    let empty = |received: &&DataFrame| {
+        received.index == index && received.len == 0 && !received.end_stream
+    };
+    pending.extend(layout.take((!end_stream).then_some(index)));
+    pending.retain(|received| received.index >= index);
+    let mut plan = VecDeque::new();
+    if len == 0 && !end_stream {
+        // A chunk carrying nothing goes as the empty frame it stands for.
+        if let Some(received) = pending.front().filter(empty).copied() {
+            pending.pop_front();
+            plan.push_back(planned(true, received));
+        }
+    } else {
+        while let Some(received) = pending.front().filter(empty).copied() {
+            pending.pop_front();
+            plan.push_back(planned(false, received));
+        }
+        let carrying = pending.front().copied().filter(|received| {
+            received.index == index && received.len == len && (len > 0 || received.end_stream)
+        });
+        if carrying.is_some() {
+            pending.pop_front();
+        }
+        plan.push_back(frame::PlannedFrame {
+            data: true,
+            padding: carrying.and_then(|received| received.padding),
+        });
+        if end_stream && len > 0 {
+            plan.extend(
+                pending
+                    .drain(..)
+                    .filter(|received| received.len == 0)
+                    .map(|received| planned(false, received)),
+            );
         }
     }
-    if before.is_empty() && padding.is_none() && after.is_empty() {
-        return before;
+    if plan.iter().all(|frame| frame.padding.is_none()) && plan.len() <= 1 {
+        plan.clear();
     }
-    before.push_back(frame::PlannedFrame {
-        data: true,
-        padding,
-    });
-    before.extend(after);
-    before
+    plan
 }
 
 impl<B> StreamRef<B> {
@@ -1298,9 +1315,11 @@ impl<B> StreamRef<B> {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
-            if let Some(layout) = &stream.body_layout {
+            if let Some(layout) = stream.body_layout.clone() {
                 let len = frame.payload().remaining();
-                *frame.plan_mut() = plan_data(&**layout, stream.body_chunks, len, end_stream);
+                let index = stream.body_chunks;
+                *frame.plan_mut() =
+                    plan_data(&*layout, &mut stream.body_frames, index, len, end_stream);
                 if len > 0 {
                     stream.body_chunks += 1;
                 }

@@ -85,6 +85,9 @@ pub(super) struct Stream {
     /// out
     pub body_chunks: u64,
 
+    /// The DATA frames `body_layout` told of that its body didn't reach yet
+    pub body_frames: std::collections::VecDeque<crate::ext::DataFrame>,
+
     // ===== Fields related to receiving =====
     /// Next node in the accept linked list
     pub next_pending_accept: Option<store::Key>,
@@ -193,6 +196,7 @@ impl Stream {
             is_pending_push: false,
             body_layout: None,
             body_chunks: 0,
+            body_frames: std::collections::VecDeque::new(),
 
             // ===== Fields related to receiving =====
             next_pending_accept: None,
