@@ -651,12 +651,19 @@ impl Prioritize {
 
         if frame.payload().has_remaining() || !frame.plan_mut().is_empty() {
             let mut stream = store.resolve(key);
+            stream.sending_planned = false;
 
             if eos {
                 frame.set_end_stream(true);
             }
 
+            // Its planned frames go whatever the window: an empty one takes none of it, and
+            // padding it lacks room for is dropped.
+            let planned = !frame.plan_mut().is_empty();
             self.push_back_frame(frame.into(), buffer, &mut stream);
+            if planned {
+                self.pending_send.push(&mut stream);
+            }
 
             return true;
         }
@@ -698,6 +705,7 @@ impl Prioritize {
             if stream.key() == key {
                 // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
                 self.in_flight_data_frame = InFlightData::Drop;
+                stream.sending_planned = false;
             }
         }
     }
@@ -730,6 +738,7 @@ impl Prioritize {
             if stream.key() == key {
                 // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
                 self.in_flight_data_frame = InFlightData::Drop;
+                stream.sending_planned = false;
             }
         }
     }
@@ -906,6 +915,7 @@ impl Prioritize {
                                     if planned.is_some() && len == sz {
                                         frame.plan_mut().pop_front();
                                     }
+                                    stream.sending_planned = !frame.plan_mut().is_empty();
                                     if frame.payload().remaining() > len
                                         || !frame.plan_mut().is_empty()
                                     {

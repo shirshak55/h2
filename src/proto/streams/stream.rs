@@ -48,6 +48,10 @@ pub(super) struct Stream {
     /// TODO: Technically this could be greater than the window size...
     pub buffered_send_data: usize,
 
+    /// Whether the DATA frame being written has planned frames left (see
+    /// `frame::Data::plan_mut`), which go once it's reclaimed.
+    pub sending_planned: bool,
+
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
 
@@ -189,6 +193,7 @@ impl Stream {
             send_flow,
             requested_send_capacity: 0,
             buffered_send_data: 0,
+            sending_planned: false,
             send_task: None,
             flush_task: None,
             pending_send: buffer::Deque::new(),
@@ -271,7 +276,9 @@ impl Stream {
             // queue to be rescheduled.
             //
             // Checking for additional buffered data lets us catch this case.
-            self.buffered_send_data == 0
+            self.buffered_send_data == 0 &&
+            // Nor may the empty frames planned after its data have to go yet.
+            !self.sending_planned
     }
 
     /// Returns true if the stream is no longer in use
