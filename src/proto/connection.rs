@@ -310,7 +310,9 @@ where
                     increment,
                 } => {
                     let stream_id = StreamId::from(stream_id);
-                    if self.inner.streams.relay_window_update(stream_id, increment) {
+                    if let Some(increment) =
+                        self.inner.streams.relay_window_update(stream_id, increment)
+                    {
                         self.codec
                             .buffer(frame::WindowUpdate::new(stream_id, increment).into())
                             .expect("invalid window update frame");

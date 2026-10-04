@@ -154,21 +154,36 @@ where
     /// Grows the connection's receive window (`id` 0), or the client's stream `id`'s, by
     /// `increment`, which a relayed WINDOW_UPDATE announces (see
     /// [`RelayedFrame::WindowUpdate`](crate::ext::RelayedFrame::WindowUpdate)): the
-    /// stream's then grows only by those. Whether it did, so that the WINDOW_UPDATE goes
-    /// out.
-    pub fn relay_window_update(&mut self, id: StreamId, increment: WindowSize) -> bool {
+    /// stream's then grows only by those, the connection's by what's left once they repaid
+    /// what it gave itself (see `Recv::relayed_connection_increment`). The increment it
+    /// grew by, so that a WINDOW_UPDATE of it goes out.
+    pub fn relay_window_update(
+        &mut self,
+        id: StreamId,
+        increment: WindowSize,
+    ) -> Option<WindowSize> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
         if id.is_zero() {
-            return me.actions.recv.inc_connection_window(increment).is_ok();
+            let peer_sent = me.relay.as_ref().map_or(0, Relay::peer_sent);
+            let increment = me
+                .actions
+                .recv
+                .relayed_connection_increment(increment, peer_sent);
+            return (increment != 0 && me.actions.recv.inc_connection_window(increment).is_ok())
+                .then_some(increment);
         }
         match me.store.find_mut(&id) {
             Some(mut stream) if !stream.state.is_closed() => {
                 stream.recv_flow.set_mirror();
                 stream.mirror_unacked = stream.mirror_unacked.saturating_sub(increment);
-                stream.recv_flow.inc_recv_window(increment).is_ok()
+                stream
+                    .recv_flow
+                    .inc_recv_window(increment)
+                    .is_ok()
+                    .then_some(increment)
             }
-            _ => false,
+            _ => None,
         }
     }
 

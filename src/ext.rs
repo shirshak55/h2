@@ -694,6 +694,8 @@ struct RelayInner {
     /// The client's streams whose windows grow only by relayed WINDOW_UPDATEs from the
     /// data they release next on (see [`Relay::mirror_stream_window`]).
     mirrored: HashSet<u32>,
+    /// The octets of data the relaying peer was sent so far (see [`Relay::set_peer_sent`]).
+    peer_sent: u64,
     /// Whether the connection ended.
     closed: bool,
 }
@@ -753,6 +755,20 @@ impl Relay {
     /// went on to it.
     pub fn mirror_stream_window(&self, stream_id: u32) {
         self.lock().mirrored.insert(stream_id);
+    }
+
+    /// Tells that the relaying peer was sent `octets` of flow-controlled data so far, the
+    /// data the client's streams released after [`Self::mirror_stream_window`] among it,
+    /// so that the relayed connection WINDOW_UPDATEs ([`RelayedFrame::WindowUpdate`] of
+    /// stream 0) from now on grow the connection's window only by what they grant past
+    /// the rest: the client's window then tracks the peer's.
+    pub fn set_peer_sent(&self, octets: u64) {
+        self.lock().peer_sent = octets;
+    }
+
+    /// The octets of data the relaying peer was sent so far (see [`Self::set_peer_sent`]).
+    pub(crate) fn peer_sent(&self) -> u64 {
+        self.lock().peer_sent
     }
 
     /// Whether the client's SETTINGS and PINGs await relayed acknowledgements.

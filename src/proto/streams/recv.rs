@@ -58,6 +58,15 @@ pub(super) struct Recv {
     /// If push promises are allowed to be received.
     is_push_enabled: bool,
 
+    /// The data the client's mirrored streams released (see `FlowControl::set_mirror`),
+    /// less what their resets gave back to the connection: the relaying peer's
+    /// connection WINDOW_UPDATEs cover it once it went on to that peer.
+    mirror_covered: u64,
+
+    /// What the relayed connection WINDOW_UPDATEs kept back of their increments (see
+    /// [`Self::relayed_connection_increment`]).
+    relay_repaid: u64,
+
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
 }
@@ -115,6 +124,8 @@ impl Recv {
             refused: None,
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+            mirror_covered: 0,
+            relay_repaid: 0,
         }
     }
 
@@ -488,6 +499,7 @@ impl Recv {
             self.in_flight_data -= capacity;
             stream.in_flight_recv_data -= capacity;
             stream.mirror_unacked = stream.mirror_unacked.saturating_add(capacity);
+            self.mirror_covered += u64::from(capacity);
             return Ok(());
         }
 
@@ -538,10 +550,27 @@ impl Recv {
         // WINDOW_UPDATEs on the stream didn't cover, which holds it.
         if stream.recv_flow.is_mirror() && stream.state.is_reset() && stream.mirror_unacked != 0 {
             self.release_connection_capacity(stream.mirror_unacked, task);
+            self.mirror_covered -= u64::from(stream.mirror_unacked);
             stream.mirror_unacked = 0;
         }
 
         self.clear_recv_buffer(stream, task, counts);
+    }
+
+    /// The part of a relayed connection WINDOW_UPDATE's `increment` that grows the
+    /// connection's window, the relaying peer having been sent `peer_sent` octets of data
+    /// (see `Relay::set_peer_sent`): the rest repays its grants for the data the client's
+    /// mirrored streams didn't send it, whose window the connection gave itself as the
+    /// client sent theirs, or never shrank.
+    pub fn relayed_connection_increment(
+        &mut self,
+        increment: WindowSize,
+        peer_sent: u64,
+    ) -> WindowSize {
+        let owed = peer_sent.saturating_sub(self.mirror_covered + self.relay_repaid);
+        let repaid = owed.min(u64::from(increment)) as WindowSize;
+        self.relay_repaid += u64::from(repaid);
+        increment - repaid
     }
 
     /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
