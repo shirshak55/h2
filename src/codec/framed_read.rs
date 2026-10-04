@@ -282,6 +282,10 @@ fn decode_frame(
             .into()
         }
         Kind::GoAway => {
+            if !head.stream_id().is_zero() {
+                proto_err!(conn: "GOAWAY on stream {:?}", head.stream_id());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
             let res = frame::GoAway::load(&bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
                 proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
