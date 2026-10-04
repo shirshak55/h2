@@ -605,16 +605,23 @@ where
 
     /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`).
     fn relay_go_away(&mut self, last_stream_id: StreamId, reason: Reason, debug_data: Bytes) {
-        let later = last_stream_id.max(self.streams.last_processed_id());
-        let last_stream_id = self.go_away.going_away().map_or(later, |going_away| {
-            later.min(going_away.last_processed_id())
-        });
+        let last_stream_id = self
+            .go_away
+            .going_away()
+            .map_or(last_stream_id, |going_away| {
+                last_stream_id.min(going_away.last_processed_id())
+            });
         self.streams.send_go_away(last_stream_id);
         self.go_away.relay(frame::GoAway::with_debug_data(
             last_stream_id,
             reason,
             debug_data,
         ));
+        if let Err(crate::proto::error::GoAway { debug_data, reason }) =
+            self.streams.refuse_above(last_stream_id)
+        {
+            self.handle_go_away(reason, debug_data, Initiator::Library);
+        }
     }
 
     fn go_away_now(&mut self, e: Reason) {

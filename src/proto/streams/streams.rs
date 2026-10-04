@@ -485,6 +485,30 @@ impl<B> DynStreams<'_, B> {
         let mut me = self.inner.lock().unwrap();
         me.actions.recv.go_away(last_processed_id);
     }
+
+    /// Refuses (REFUSED_STREAM) each open stream the peer opened past `last_processed_id`,
+    /// which a GOAWAY naming it tells the peer went unprocessed.
+    pub fn refuse_above(
+        &mut self,
+        last_processed_id: StreamId,
+    ) -> Result<(), crate::proto::error::GoAway> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let peer = me.counts.peer();
+        let mut refused = Vec::new();
+        me.store.for_each(|stream| {
+            if stream.id > last_processed_id
+                && !peer.is_local_init(stream.id)
+                && !stream.state.is_closed()
+            {
+                refused.push(stream.id);
+            }
+        });
+        for id in refused {
+            me.send_reset(self.send_buffer, id, Reason::REFUSED_STREAM)?;
+        }
+        Ok(())
+    }
 }
 
 impl Inner {

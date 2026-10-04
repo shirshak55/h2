@@ -429,10 +429,10 @@ impl RelayedEnd {
     }
 
     /// Sends a GOAWAY of `error_code` and `debug_data` naming `last_stream_id`, or, when
-    /// later, the last stream the connection accepted, as those are answered through the
-    /// relay, or, when earlier, the stream the GOAWAY it sent before named. The connection
-    /// then accepts no later stream, and stays open until [`Self::close`] or the client
-    /// closes it.
+    /// earlier, the stream the GOAWAY it sent before named, and refuses (REFUSED_STREAM)
+    /// each open stream the client opened past it, which the GOAWAY tells went
+    /// unprocessed. The connection then accepts no later stream, and stays open until
+    /// [`Self::close`] or the client closes it.
     pub fn go_away(&self, last_stream_id: u32, error_code: u32, debug_data: Bytes) {
         let mut inner = self.lock();
         inner
