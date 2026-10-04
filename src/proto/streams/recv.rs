@@ -525,6 +525,34 @@ impl Recv {
         Ok(())
     }
 
+    /// Grows mirrored `stream`'s window (see `FlowControl::set_mirror`), and the
+    /// connection's, by `padding` octets of the padding it received and released that the
+    /// relaying peer isn't sent, whose WINDOW_UPDATEs never grow them by it.
+    pub fn release_mirrored_padding(
+        &mut self,
+        padding: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        let padding = padding.min(stream.mirror_unacked);
+        if padding == 0 {
+            return;
+        }
+        stream.mirror_unacked -= padding;
+        self.mirror_covered -= u64::from(padding);
+        // TODO: proper error handling
+        let _res = self.flow.assign_capacity(padding);
+        debug_assert!(_res.is_ok());
+        let _res = stream.recv_flow.assign_capacity(padding);
+        debug_assert!(_res.is_ok());
+        if stream.recv_flow.unclaimed_capacity().is_some() {
+            self.pending_window_updates.push(stream);
+        }
+        if let Some(task) = task.take() {
+            task.wake();
+        }
+    }
+
     /// Release any unclaimed capacity for a closed stream.
     pub fn release_closed_capacity(
         &mut self,
@@ -825,6 +853,10 @@ impl Recv {
             let _res = self.release_capacity(padding, stream, &mut None);
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
+            // Padding the relaying peer isn't sent grows the windows here.
+            if stream.recv_flow.is_mirror() && !stream.relays_padding {
+                self.release_mirrored_padding(padding, stream, &mut None);
+            }
         }
 
         // An empty DATA frame without END_STREAM has no effect on the HTTP

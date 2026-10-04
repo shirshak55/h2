@@ -133,6 +133,11 @@ impl PingPong {
         self.relayed.push(payload);
     }
 
+    /// How many relayed PINGs sent await their ACKs.
+    pub(crate) fn relayed_waiting(&self) -> usize {
+        self.relayed.len()
+    }
+
     /// Can only be called once. If called a second time, returns `None`.
     pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {
         if self.user_pings.is_some() {

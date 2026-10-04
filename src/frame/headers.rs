@@ -342,6 +342,11 @@ impl Headers {
         self.header_block.received = Some(Box::new(received));
     }
 
+    /// How the frame was received, when attached (see [`Self::set_received`]).
+    pub(crate) fn received(&self) -> Option<&HeadersFrame> {
+        self.header_block.received.as_deref()
+    }
+
     pub(crate) fn take_received(&mut self) -> Option<HeadersFrame> {
         self.header_block.received.take().map(|received| *received)
     }

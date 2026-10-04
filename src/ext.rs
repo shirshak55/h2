@@ -4,7 +4,7 @@ use crate::hpack::BytesStr;
 
 use bytes::Bytes;
 use http::HeaderName;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
@@ -93,6 +93,10 @@ struct FrameLogInner {
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
     /// Called with every frame logged from now on (see [`FrameLog::on_frame`]).
     hooks: Vec<FrameHook>,
+    /// The streams of the latest requests the connection didn't hand over, oldest first,
+    /// and the hooks called with each from now on (see [`FrameLog::on_unhandled`]).
+    unhandled: VecDeque<u32>,
+    unhandled_hooks: Vec<UnhandledHook>,
     /// The bodies kept of the messages whose streams are open, by stream (see
     /// [`HeadersFrame::body`]).
     bodies: HashMap<u32, Weak<Mutex<ReceivedBody>>>,
@@ -107,6 +111,18 @@ impl fmt::Debug for FrameHook {
     }
 }
 
+#[derive(Clone)]
+struct UnhandledHook(Arc<dyn Fn(u32) + Send + Sync>);
+
+impl fmt::Debug for UnhandledHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("UnhandledHook(..)")
+    }
+}
+
+/// How many of the latest requests a connection didn't hand over a [`FrameLog`] keeps.
+const UNHANDLED: usize = 1024;
+
 impl FrameLog {
     pub(crate) fn new(limit: usize) -> Self {
         FrameLog(Arc::new(Mutex::new(FrameLogInner {
@@ -115,6 +131,8 @@ impl FrameLog {
             dropped: 0,
             subscribers: Vec::new(),
             hooks: Vec::new(),
+            unhandled: VecDeque::new(),
+            unhandled_hooks: Vec::new(),
             bodies: HashMap::new(),
         })))
     }
@@ -167,6 +185,35 @@ impl FrameLog {
     /// connection acts on it.
     pub fn on_frame(&self, hook: impl Fn(&LoggedFrame) + Send + Sync + 'static) {
         self.lock().hooks.push(FrameHook(Arc::new(hook)));
+    }
+
+    /// Calls `hook` with the stream of each request whose HEADERS the connection received
+    /// but won't hand over (refused, reset as malformed, answered itself, or opened past
+    /// its GOAWAY), as it does, after those so far (the latest 1,024).
+    pub fn on_unhandled(&self, hook: impl Fn(u32) + Send + Sync + 'static) {
+        let hook = UnhandledHook(Arc::new(hook));
+        let mut inner = self.lock();
+        let past: Vec<u32> = inner.unhandled.iter().copied().collect();
+        inner.unhandled_hooks.push(hook.clone());
+        drop(inner);
+        for stream_id in past {
+            (hook.0)(stream_id);
+        }
+    }
+
+    /// Tells that the connection won't hand over the request on `stream_id` (see
+    /// [`Self::on_unhandled`]).
+    pub(crate) fn unhandled(&self, stream_id: u32) {
+        let mut inner = self.lock();
+        if inner.unhandled.len() == UNHANDLED {
+            inner.unhandled.pop_front();
+        }
+        inner.unhandled.push_back(stream_id);
+        let hooks = inner.unhandled_hooks.clone();
+        drop(inner);
+        for hook in hooks {
+            (hook.0)(stream_id);
+        }
     }
 
     /// Starts keeping the body of the message whose header block opened `stream_id`.
@@ -557,8 +604,9 @@ pub struct RelayedEnd(Arc<Mutex<RelayedEndInner>>);
 
 #[derive(Debug, Default)]
 struct RelayedEndInner {
-    /// The GOAWAYs to send: their last stream id, error code and debug data.
-    go_aways: Vec<(u32, u32, Bytes)>,
+    /// The GOAWAYs to send: their last stream id, error code and debug data, and the
+    /// client's streams the other connection carried that they leave unprocessed.
+    go_aways: Vec<(u32, u32, Bytes, Vec<u32>)>,
     close: bool,
     task: Option<Waker>,
 }
@@ -569,16 +617,25 @@ impl RelayedEnd {
         Self::default()
     }
 
-    /// Sends a GOAWAY of `error_code` and `debug_data` naming `last_stream_id`, or, when
-    /// earlier, the stream the GOAWAY it sent before named, and refuses (REFUSED_STREAM)
-    /// each open stream the client opened past it, which the GOAWAY tells went
-    /// unprocessed. The connection then accepts no later stream, and stays open until
-    /// [`Self::close`] or the client closes it.
-    pub fn go_away(&self, last_stream_id: u32, error_code: u32, debug_data: Bytes) {
+    /// Sends a GOAWAY of `error_code` and `debug_data` the other connection sent naming
+    /// `last_stream_id`, the client's streams it carried past that, still open, being
+    /// `refused`. The GOAWAY names the latest stream the client opened that isn't refused
+    /// when later (one another connection carried, or answered without one, which went on
+    /// regardless), or, when earlier, the stream the GOAWAY it sent before named; each
+    /// refused stream, and each open one past the stream it names, is refused
+    /// (REFUSED_STREAM), as unprocessed. The connection then accepts no later stream, and
+    /// stays open until [`Self::close`] or the client closes it.
+    pub fn go_away(
+        &self,
+        last_stream_id: u32,
+        error_code: u32,
+        debug_data: Bytes,
+        refused: Vec<u32>,
+    ) {
         let mut inner = self.lock();
         inner
             .go_aways
-            .push((last_stream_id, error_code, debug_data));
+            .push((last_stream_id, error_code, debug_data, refused));
         inner.wake();
     }
 
@@ -594,7 +651,11 @@ impl RelayedEnd {
     }
 
     /// The GOAWAYs to send, and whether to close once idle; `cx` is woken when more come.
-    pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> (Vec<(u32, u32, Bytes)>, bool) {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn poll_take(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> (Vec<(u32, u32, Bytes, Vec<u32>)>, bool) {
         let mut inner = self.lock();
         inner.task = Some(cx.waker().clone());
         (std::mem::take(&mut inner.go_aways), inner.close)
@@ -686,14 +747,25 @@ pub struct Relay(Arc<Mutex<RelayInner>>);
 #[derive(Debug, Default)]
 struct RelayInner {
     frames: VecDeque<RelayedFrame>,
+    /// The octets of the payloads of the unknown frames among them.
+    octets: usize,
     task: Option<Waker>,
+    /// The caller's task waiting for room (see [`Relay::poll_ready`]).
+    ready: Option<Waker>,
     on_ack: Option<AckHook>,
     /// Whether the client's SETTINGS and PINGs await relayed acknowledgements (see
     /// [`Relay::relay_acks`]).
     relays_acks: bool,
     /// The client's streams whose windows grow only by relayed WINDOW_UPDATEs from the
-    /// data they release next on (see [`Relay::mirror_stream_window`]).
-    mirrored: HashSet<u32>,
+    /// data they release next on, each with whether the relaying peer is sent the padding
+    /// they receive (see [`Relay::mirror_stream_window`]).
+    mirrored: HashMap<u32, bool>,
+    /// The padding the client's streams received that the relaying peer isn't sent, by
+    /// stream, which grows their windows here (see [`Relay::release_padding`]).
+    released_padding: Vec<(u32, u32)>,
+    /// Whether the client sends more than the relaying peer takes (see
+    /// [`Relay::go_away_flooded`]).
+    flooded: bool,
     /// The octets of data the relaying peer was sent so far (see [`Relay::set_peer_sent`]).
     peer_sent: u64,
     /// Whether the connection ended.
@@ -709,6 +781,12 @@ impl fmt::Debug for AckHook {
     }
 }
 
+/// How many frames sent through a [`Relay`] await the connection at most, and the octets
+/// of the unknown frames' payloads among them, before it has no room (see
+/// [`Relay::poll_ready`]).
+const RELAYED_FRAMES: usize = 1024;
+const RELAYED_OCTETS: usize = 1 << 20;
+
 impl Relay {
     fn lock(&self) -> MutexGuard<'_, RelayInner> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -720,10 +798,42 @@ impl Relay {
         if inner.closed {
             return;
         }
-        inner.frames.push_back(frame);
-        if let Some(task) = inner.task.take() {
-            task.wake();
+        if let RelayedFrame::Unknown { payload, .. } = &frame {
+            inner.octets += payload.len();
         }
+        inner.frames.push_back(frame);
+        inner.wake();
+    }
+
+    /// Ready once the frames sent (see [`Self::send`]) leave room for more, or the
+    /// connection ended: at most 1,024 of them, or 1 MiB of unknown frames' payloads, await
+    /// the connection, which takes them as the client reads what it sent before, so a
+    /// client slow to read holds the caller back rather than more frames.
+    pub fn poll_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<()> {
+        let mut inner = self.lock();
+        if inner.closed || (inner.frames.len() < RELAYED_FRAMES && inner.octets < RELAYED_OCTETS) {
+            return std::task::Poll::Ready(());
+        }
+        inner.ready = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+
+    /// Ends the connection with a GOAWAY of ENHANCE_YOUR_CALM: the client sends frames
+    /// faster than the relaying peer takes them.
+    pub fn go_away_flooded(&self) {
+        let mut inner = self.lock();
+        inner.flooded = true;
+        inner.wake();
+    }
+
+    /// Grows the receive window of the client's stream `stream_id`, mirrored (see
+    /// [`Self::mirror_stream_window`]), and the connection's, by `octets` of the padding it
+    /// received (pad length fields included) that the relaying peer wasn't sent, so whose
+    /// WINDOW_UPDATEs don't grow them by it.
+    pub fn release_padding(&self, stream_id: u32, octets: u32) {
+        let mut inner = self.lock();
+        inner.released_padding.push((stream_id, octets));
+        inner.wake();
     }
 
     /// Leaves acknowledging the client's SETTINGS and PINGs from now on to the relaying
@@ -754,9 +864,11 @@ impl Relay {
     /// Makes the receive window of the client's stream `stream_id` grow only by the
     /// relayed WINDOW_UPDATEs ([`RelayedFrame::WindowUpdate`]) from the data it releases
     /// next on, rather than by that data, as the relaying peer's window does once that data
-    /// went on to it.
-    pub fn mirror_stream_window(&self, stream_id: u32) {
-        self.lock().mirrored.insert(stream_id);
+    /// went on to it; by its padding too, as it comes, unless `relays_padding` says the
+    /// relaying peer is sent that as well, whose WINDOW_UPDATEs then grow it by that (see
+    /// [`Self::release_padding`] for the padding it isn't sent after all).
+    pub fn mirror_stream_window(&self, stream_id: u32, relays_padding: bool) {
+        self.lock().mirrored.insert(stream_id, relays_padding);
     }
 
     /// Tells that the relaying peer was sent `octets` of flow-controlled data so far, the
@@ -779,9 +891,22 @@ impl Relay {
     }
 
     /// Whether `stream_id`'s window was made to grow only by relayed WINDOW_UPDATEs since
-    /// last asked (see [`Self::mirror_stream_window`]).
-    pub(crate) fn take_mirrored(&self, stream_id: u32) -> bool {
+    /// last asked, and if so whether the relaying peer is sent its padding (see
+    /// [`Self::mirror_stream_window`]).
+    pub(crate) fn take_mirrored(&self, stream_id: u32) -> Option<bool> {
         self.lock().mirrored.remove(&stream_id)
+    }
+
+    /// The padding the client's streams received that the relaying peer wasn't sent, told
+    /// since last asked (see [`Self::release_padding`]).
+    pub(crate) fn take_released_padding(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.lock().released_padding)
+    }
+
+    /// Whether the client sends more than the relaying peer takes (see
+    /// [`Self::go_away_flooded`]).
+    pub(crate) fn is_flooded(&self) -> bool {
+        self.lock().flooded
     }
 
     /// Calls `hook` with each of the client's acknowledgements of the relayed frames from
@@ -795,6 +920,10 @@ impl Relay {
     pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> VecDeque<RelayedFrame> {
         let mut inner = self.lock();
         inner.task = Some(cx.waker().clone());
+        inner.octets = 0;
+        if let Some(ready) = inner.ready.take() {
+            ready.wake();
+        }
         std::mem::take(&mut inner.frames)
     }
 
@@ -813,5 +942,18 @@ impl Relay {
         inner.frames.clear();
         inner.on_ack = None;
         inner.mirrored.clear();
+        inner.released_padding.clear();
+        if let Some(ready) = inner.ready.take() {
+            ready.wake();
+        }
+    }
+}
+
+impl RelayInner {
+    /// Wakes the connection's task.
+    fn wake(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.wake();
+        }
     }
 }

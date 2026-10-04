@@ -181,6 +181,11 @@ impl Settings {
         self.waiting.push_back((frame, true));
     }
 
+    /// How many relayed SETTINGS frames sent await their ACKs.
+    pub(crate) fn relayed_waiting(&self) -> usize {
+        self.waiting.iter().filter(|(_, relayed)| *relayed).count()
+    }
+
     /// Sets `true` to `self.has_received_remote_initial_settings`.
     /// Returns `true` if this method is called for the first time.
     /// (i.e. it is the initial SETTINGS frame from the remote peer)

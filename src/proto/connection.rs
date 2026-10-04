@@ -17,6 +17,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
 
+/// How many relayed SETTINGS frames, or PINGs, may await the client's ACKs at once: those
+/// past them wait, so that the relaying caller waits too (see `Relay::poll_ready`).
+const MAX_RELAYED_WAITING: usize = 1024;
+
 /// An H2 connection
 #[derive(Debug)]
 pub(crate) struct Connection<T, P, B: Buf = Bytes>
@@ -269,10 +273,18 @@ where
         let relays_acks = relay.relays_acks() && forwards;
         self.inner.settings.set_relays_acks(relays_acks, forwards);
         self.inner.ping_pong.set_relays_acks(relays_acks, forwards);
+        if relay.is_flooded() {
+            return Poll::Ready(Err(Error::library_go_away_data(
+                Reason::ENHANCE_YOUR_CALM,
+                "relayed_frames_backlog",
+            )));
+        }
+        for (stream_id, octets) in relay.take_released_padding() {
+            self.inner.streams.release_padding(stream_id.into(), octets);
+        }
         if self.deferred_preface.is_some() {
             return Poll::Ready(Ok(()));
         }
-        self.relayed.extend(relay.poll_take(cx));
         if !relays_acks {
             while self.inner.settings.is_awaiting() {
                 ready!(self.codec.poll_ready(cx))?;
@@ -288,7 +300,30 @@ where
                     .expect("invalid ping frame");
             }
         }
-        while !self.relayed.is_empty() {
+        // Taken once those taken before went, so that a client slow to read holds the
+        // relaying caller back (see `Relay::poll_ready`).
+        loop {
+            if self.relayed.is_empty() {
+                self.relayed = relay.poll_take(cx);
+                if self.relayed.is_empty() {
+                    break;
+                }
+            }
+            // A relayed SETTINGS frame or PING waits while as many as may await the
+            // client's ACKs do.
+            match self.relayed.front() {
+                Some(RelayedFrame::Settings(_))
+                    if self.inner.settings.relayed_waiting() >= MAX_RELAYED_WAITING =>
+                {
+                    break
+                }
+                Some(RelayedFrame::Ping(_))
+                    if self.inner.ping_pong.relayed_waiting() >= MAX_RELAYED_WAITING =>
+                {
+                    break
+                }
+                _ => {}
+            }
             ready!(self.codec.poll_ready(cx))?;
             match self.relayed.pop_front().expect("a frame is relayed") {
                 RelayedFrame::Settings(params) => {
@@ -427,11 +462,12 @@ where
 
         if let Some(relayed) = &self.relayed_end {
             let (go_aways, close) = relayed.poll_take(cx);
-            for (last_stream_id, error_code, debug_data) in go_aways {
+            for (last_stream_id, error_code, debug_data, refused) in go_aways {
                 self.inner.as_dyn().relay_go_away(
                     last_stream_id.into(),
                     error_code.into(),
                     debug_data,
+                    &refused,
                 );
             }
             self.relayed_close = close;
@@ -642,7 +678,20 @@ where
     }
 
     /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`).
-    fn relay_go_away(&mut self, last_stream_id: StreamId, reason: Reason, debug_data: Bytes) {
+    fn relay_go_away(
+        &mut self,
+        last_stream_id: StreamId,
+        reason: Reason,
+        debug_data: Bytes,
+        refused: &[u32],
+    ) {
+        // The latest stream the client opened that the other connection didn't leave
+        // unprocessed went on regardless.
+        let mut processed = self.streams.last_processed_id();
+        while processed > last_stream_id && refused.contains(&u32::from(processed)) {
+            processed = StreamId::from(u32::from(processed).saturating_sub(2));
+        }
+        let last_stream_id = last_stream_id.max(processed);
         let last_stream_id = self
             .go_away
             .going_away()
@@ -656,7 +705,7 @@ where
             debug_data,
         ));
         if let Err(crate::proto::error::GoAway { debug_data, reason }) =
-            self.streams.refuse_above(last_stream_id)
+            self.streams.refuse(last_stream_id, refused)
         {
             self.handle_go_away(reason, debug_data, Initiator::Library);
         }

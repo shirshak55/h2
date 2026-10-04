@@ -128,8 +128,10 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
+        // A mirrored window grows here only by padding the relaying peer isn't sent (see
+        // `Recv::release_mirrored_padding`), at once.
         if self.mirror {
-            return None;
+            return Some(unclaimed as WindowSize);
         }
         let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
 

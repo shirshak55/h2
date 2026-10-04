@@ -108,6 +108,10 @@ pub(super) struct Stream {
     /// `FlowControl::set_mirror`) that those didn't cover yet.
     pub mirror_unacked: WindowSize,
 
+    /// Whether the relaying peer is sent the padding received while the window grows only
+    /// by its WINDOW_UPDATEs, which then grow it by that too; else it grows by it here.
+    pub relays_padding: bool,
+
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -213,6 +217,7 @@ impl Stream {
             recv_flow,
             in_flight_recv_data: 0,
             mirror_unacked: 0,
+            relays_padding: false,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,

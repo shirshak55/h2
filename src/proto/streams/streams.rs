@@ -187,6 +187,21 @@ where
         }
     }
 
+    /// Grows the receive window of the client's mirrored stream `id`, and the connection's,
+    /// by `octets` of the padding it received that the relaying peer wasn't sent (see
+    /// `Relay::release_padding`).
+    pub fn release_padding(&mut self, id: StreamId, octets: WindowSize) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if let Some(mut stream) = me.store.find_mut(&id) {
+            if stream.recv_flow.is_mirror() {
+                me.actions
+                    .recv
+                    .release_mirrored_padding(octets, &mut stream, &mut me.actions.task);
+            }
+        }
+    }
+
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -457,8 +472,25 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
+        let id = frame.stream_id();
+        // The log of a request opening a stream, told should it not be handed over.
+        let opening = frame
+            .received()
+            .map(|received| received.connection.clone())
+            .filter(|_| self.peer.is_server() && me.store.find_mut(&id).is_none());
 
-        me.recv_headers(self.peer, self.send_buffer, frame)
+        let result = me.recv_headers(self.peer, self.send_buffer, frame);
+        if let Some(log) = opening {
+            let handed = me
+                .store
+                .find_mut(&id)
+                .map_or(false, |stream| stream.is_pending_accept);
+            drop(me);
+            if !handed {
+                log.unhandled(id.into());
+            }
+        }
+        result
     }
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
@@ -517,17 +549,18 @@ impl<B> DynStreams<'_, B> {
     }
 
     /// Refuses (REFUSED_STREAM) each open stream the peer opened past `last_processed_id`,
-    /// which a GOAWAY naming it tells the peer went unprocessed.
-    pub fn refuse_above(
+    /// which a GOAWAY naming it tells the peer went unprocessed, and each one of `unprocessed`.
+    pub fn refuse(
         &mut self,
         last_processed_id: StreamId,
+        unprocessed: &[u32],
     ) -> Result<(), crate::proto::error::GoAway> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
         let peer = me.counts.peer();
         let mut refused = Vec::new();
         me.store.for_each(|stream| {
-            if stream.id > last_processed_id
+            if (stream.id > last_processed_id || unprocessed.contains(&u32::from(stream.id)))
                 && !peer.is_local_init(stream.id)
                 && !stream.state.is_closed()
             {
@@ -560,11 +593,12 @@ impl Inner {
     /// Makes `stream`'s window grow only by relayed WINDOW_UPDATEs, if asked to since
     /// last checked (see `Relay::mirror_stream_window`).
     fn mirror_if_asked(relay: &Option<Relay>, stream: &mut Stream) {
-        if relay
+        if let Some(relays_padding) = relay
             .as_ref()
-            .map_or(false, |relay| relay.take_mirrored(stream.id.into()))
+            .and_then(|relay| relay.take_mirrored(stream.id.into()))
         {
             stream.recv_flow.set_mirror();
+            stream.relays_padding = relays_padding;
         }
     }
 
