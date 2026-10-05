@@ -693,6 +693,8 @@ struct RelayedEndInner {
     sent: u64,
     /// The tasks waiting for one to go (see [`RelayedEnd::poll_sent`]).
     sent_tasks: Vec<Waker>,
+    /// The bytes the connection wrote to the client (see [`RelayedEnd::written`]).
+    written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A GOAWAY to send (see [`RelayedEnd::go_away`]): its last stream id, error code and
@@ -783,6 +785,14 @@ impl RelayedEnd {
         Poll::Pending
     }
 
+    /// How many bytes the connection wrote to the client so far: while it reads none, a
+    /// GOAWAY waiting for the frames queued before it (see [`Self::poll_sent`]) doesn't go.
+    pub fn written(&self) -> u64 {
+        self.lock()
+            .written
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Closes the connection once it has no streams, with no GOAWAY of its own.
     pub fn close(&self) {
         let mut inner = self.lock();
@@ -799,6 +809,11 @@ impl RelayedEnd {
         let mut inner = self.lock();
         inner.task = Some(cx.waker().clone());
         inner.close
+    }
+
+    /// The counter of the bytes the connection writes (see [`Self::written`]).
+    pub(crate) fn written_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.lock().written)
     }
 
     /// Takes the next GOAWAY to send, the connection having sent the frames queued before.

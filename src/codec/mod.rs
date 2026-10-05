@@ -64,6 +64,11 @@ impl<T, B> Codec<T, B> {
         self.inner.set_frame_log(log)
     }
 
+    /// Counts the bytes it writes to the peer from now on in `counter`.
+    pub(crate) fn count_written(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.framed_write().count_written(counter)
+    }
+
     /// Holds every write back until `release`.
     pub(crate) fn hold_writes(&mut self) {
         self.framed_write().hold()

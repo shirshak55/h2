@@ -157,7 +157,7 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+    pub fn new(mut codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
@@ -183,6 +183,9 @@ where
         let mut streams = Streams::new(streams_config(&config));
         if let Some(preface) = &config.deferred_preface {
             streams.set_relay(preface.relay());
+        }
+        if let Some(end) = &config.relayed_end {
+            codec.count_written(end.written_counter());
         }
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());

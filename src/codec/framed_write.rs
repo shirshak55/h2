@@ -5,6 +5,8 @@ use crate::hpack;
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::io::poll_write_buf;
@@ -28,6 +30,9 @@ pub struct FramedWrite<T, B> {
     hold: Hold,
 
     encoder: Encoder<B>,
+
+    /// Counts the bytes written to `inner`, when set (see `count_written`).
+    written: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug)]
@@ -103,6 +108,7 @@ where
             inner,
             final_flush_done: false,
             hold: Hold::Open,
+            written: None,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -166,6 +172,7 @@ where
                     if n == 0 {
                         return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                     }
+                    count(&self.written, n);
                 }
                 self.hold = Hold::Open;
             }
@@ -193,6 +200,7 @@ where
                     tracing::trace!("write returned zero, but non-zero bytes remaining");
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
+                count(&self.written, n);
             }
 
             match self.encoder.unset_frame() {
@@ -361,6 +369,11 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    /// Counts the bytes it writes from now on in `counter`.
+    pub(crate) fn count_written(&mut self, counter: Arc<AtomicU64>) {
+        self.written = Some(counter);
+    }
+
     /// Holds every write back: frames buffer but nothing reaches the wire until
     /// `release`.
     pub fn hold(&mut self) {
@@ -419,5 +432,12 @@ mod unstable {
         pub fn get_ref(&self) -> &T {
             &self.inner
         }
+    }
+}
+
+/// Adds `n` bytes written to `written`, when counting.
+fn count(written: &Option<Arc<AtomicU64>>, n: usize) {
+    if let Some(written) = written {
+        written.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
