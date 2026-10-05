@@ -1044,10 +1044,11 @@ impl Relay {
         }
     }
 
-    /// Leaves the client's PINGs awaiting a relayed acknowledgement, and those it sends from
-    /// now on, unacknowledged, as the relaying peer left them, rather than have them hold
-    /// back its frames (see [`Self::relay_acks`]): the connection doesn't acknowledge them
-    /// itself, but an acknowledgement still relayed goes on.
+    /// Leaves the client's PINGs awaiting a relayed acknowledgement unacknowledged, as the
+    /// relaying peer left them, rather than have them hold back its frames (see
+    /// [`Self::relay_acks`]), and those it sends from now on until the connection
+    /// acknowledges them itself ([`Self::ack_locally`]); an acknowledgement still relayed
+    /// goes on.
     pub fn release_pings(&self) {
         let mut inner = self.lock();
         inner.releases_pings = true;
