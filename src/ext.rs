@@ -7,7 +7,7 @@ use http::HeaderName;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Waker};
 
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
@@ -688,17 +688,23 @@ struct RelayedEndInner {
     go_aways: VecDeque<RelayedGoAway>,
     close: bool,
     task: Option<Waker>,
+    /// How many GOAWAYs were relayed, and the number of the last that went.
+    relayed: u64,
+    sent: u64,
+    /// The tasks waiting for one to go (see [`RelayedEnd::poll_sent`]).
+    sent_tasks: Vec<Waker>,
 }
 
 /// A GOAWAY to send (see [`RelayedEnd::go_away`]): its last stream id, error code and
-/// debug data, and the client's streams the other connection carried that it leaves
-/// unprocessed, sorted.
+/// debug data, the client's streams the other connection carried that it leaves
+/// unprocessed, sorted, and its number.
 #[derive(Debug)]
 pub(crate) struct RelayedGoAway {
     pub(crate) last_stream_id: u32,
     pub(crate) error_code: u32,
     pub(crate) debug_data: Bytes,
     pub(crate) refused: Vec<u32>,
+    pub(crate) number: u64,
 }
 
 /// How many GOAWAYs a [`RelayedEnd`] holds unsent; one past them merges into the last.
@@ -721,17 +727,21 @@ impl RelayedEnd {
     ///
     /// Each goes out once the frames queued before it went. Past four waiting so, a GOAWAY
     /// merges into the last: that one then names the lower last stream id of the two, with
-    /// this one's error code and debug data, refusing the streams either refuses.
+    /// this one's error code, debug data and number, refusing the streams either refuses.
+    ///
+    /// Returns its number (one more than the last's), for [`Self::poll_sent`].
     pub fn go_away(
         &self,
         last_stream_id: u32,
         error_code: u32,
         debug_data: Bytes,
         mut refused: Vec<u32>,
-    ) {
+    ) -> u64 {
         refused.sort_unstable();
         refused.dedup();
         let mut inner = self.lock();
+        inner.relayed += 1;
+        let number = inner.relayed;
         let waiting = inner.go_aways.len();
         match inner.go_aways.back_mut() {
             Some(last) if waiting >= RELAYED_GO_AWAYS => {
@@ -741,15 +751,36 @@ impl RelayedEnd {
                 last.refused.extend(refused);
                 last.refused.sort_unstable();
                 last.refused.dedup();
+                last.number = number;
             }
             _ => inner.go_aways.push_back(RelayedGoAway {
                 last_stream_id,
                 error_code,
                 debug_data,
                 refused,
+                number,
             }),
         }
         inner.wake();
+        number
+    }
+
+    /// Ready once the GOAWAY numbered `number` (see [`Self::go_away`]), or one merged with
+    /// it or after it, went: written after the frames queued before it and ahead of those
+    /// queued from then on. Also ready once the connection is gone.
+    pub fn poll_sent(&self, cx: &mut Context<'_>, number: u64) -> Poll<()> {
+        let mut inner = self.lock();
+        if inner.sent >= number {
+            return Poll::Ready(());
+        }
+        if !inner
+            .sent_tasks
+            .iter()
+            .any(|task| task.will_wake(cx.waker()))
+        {
+            inner.sent_tasks.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// Closes the connection once it has no streams, with no GOAWAY of its own.
@@ -773,6 +804,13 @@ impl RelayedEnd {
     /// Takes the next GOAWAY to send, the connection having sent the frames queued before.
     pub(crate) fn take_go_away(&self) -> Option<RelayedGoAway> {
         self.lock().go_aways.pop_front()
+    }
+
+    /// Notes that the GOAWAY numbered `number` went (`u64::MAX`: the connection is gone).
+    pub(crate) fn sent(&self, number: u64) {
+        let mut inner = self.lock();
+        inner.sent = inner.sent.max(number);
+        inner.sent_tasks.drain(..).for_each(Waker::wake);
     }
 }
 

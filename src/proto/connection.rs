@@ -38,10 +38,11 @@ where
     /// `server::Builder::leave_close_to_client`).
     leave_close_to_client: bool,
 
-    /// The end of another connection it ends as (see `server::Builder::relayed_end`), and
-    /// whether it closed.
+    /// The end of another connection it ends as (see `server::Builder::relayed_end`),
+    /// whether it closed, and the number of the relayed GOAWAY waiting to be written.
     relayed_end: Option<RelayedEnd>,
     relayed_close: bool,
+    relayed_unsent: Option<u64>,
 
     /// The frames relayed to the peer after the deferred preface (see `Relay`), and those
     /// taken from it still to send.
@@ -194,6 +195,7 @@ where
             leave_close_to_client: config.leave_close_to_client,
             relayed_end: config.relayed_end,
             relayed_close: false,
+            relayed_unsent: None,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -410,7 +412,14 @@ where
     /// This will return `Some(reason)` if the connection should be closed
     /// afterwards. If this is a graceful shutdown, this returns `None`.
     fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
-        self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+        let polled = self.inner.go_away.send_pending_go_away(cx, &mut self.codec);
+        if !self.inner.go_away.is_sending() {
+            if let (Some(number), Some(relayed)) = (self.relayed_unsent, &self.relayed_end) {
+                relayed.sent(number);
+                self.relayed_unsent = None;
+            }
+        }
+        polled
     }
 
     pub fn go_away_from_user(&mut self, e: Reason) {
@@ -511,6 +520,7 @@ where
                                     go_away.debug_data,
                                     &go_away.refused,
                                 );
+                                self.relayed_unsent = Some(go_away.number);
                                 continue;
                             }
 
@@ -1009,6 +1019,9 @@ where
         let _ = self.inner.streams.recv_eof(true);
         if let Some(relay) = &self.relay {
             relay.close();
+        }
+        if let Some(relayed) = &self.relayed_end {
+            relayed.sent(u64::MAX);
         }
     }
 }
