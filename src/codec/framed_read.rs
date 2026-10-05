@@ -37,6 +37,10 @@ pub struct FramedRead<T> {
 
     /// Logs the peer's frames, when recording them.
     frame_log: Option<FrameLog>,
+
+    /// A frame read and not yet decoded, as the log's read gate holds it (see
+    /// `FrameLog::gate_reads`).
+    gated: Option<BytesMut>,
 }
 
 /// Partially loaded headers frame
@@ -69,6 +73,7 @@ impl<T> FramedRead<T> {
             max_continuation_frames,
             partial: None,
             frame_log: None,
+            gated: None,
         }
     }
 
@@ -196,7 +201,7 @@ fn decode_frame(
             let is_end_headers = frame.is_end_headers();
 
             // Load the HPACK encoded headers
-            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
+            match frame.load_hpack(&mut payload, max_header_list_size, hpack, true) {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
                 Err(frame::Error::MalformedMessage) => {
@@ -518,15 +523,24 @@ where
         let span = tracing::trace_span!("FramedRead::poll_next");
         let _e = span.enter();
         loop {
-            if let Some(log) = &self.frame_log {
-                ready!(log.poll_gate(cx));
-            }
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-                Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
-                None => return Poll::Ready(None),
+            let bytes = match self.gated.take() {
+                Some(bytes) => bytes,
+                None => match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                    None => return Poll::Ready(None),
+                },
             };
+            // The gate holds every frame but DATA, which flow control and the received data
+            // awaiting release (`Recv::poll_buffered_room`) bound.
+            if let Some(log) = &self.frame_log {
+                if frame::Head::parse(&bytes).kind() != Kind::Data && log.poll_gate(cx).is_pending()
+                {
+                    self.gated = Some(bytes);
+                    return Poll::Pending;
+                }
+            }
 
             tracing::trace!(read.bytes = bytes.len());
             let Self {
@@ -580,6 +594,7 @@ impl Continuable {
         }
     }
 
+    /// Decodes the header block's next fragment, a CONTINUATION frame's.
     fn load_hpack(
         &mut self,
         src: &mut BytesMut,
@@ -587,8 +602,12 @@ impl Continuable {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), frame::Error> {
         match *self {
-            Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
-            Continuable::PushPromise(ref mut p) => p.load_hpack(src, max_header_list_size, decoder),
+            Continuable::Headers(ref mut h) => {
+                h.load_hpack(src, max_header_list_size, decoder, false)
+            }
+            Continuable::PushPromise(ref mut p) => {
+                p.load_hpack(src, max_header_list_size, decoder, false)
+            }
         }
     }
 }

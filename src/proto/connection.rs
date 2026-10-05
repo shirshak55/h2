@@ -38,16 +38,19 @@ where
     /// `server::Builder::leave_close_to_client`).
     leave_close_to_client: bool,
 
-    /// The end of another connection it ends as (see `server::Builder::relayed_end`), its
-    /// GOAWAYs to send once the frames queued before them went, and whether it closed.
+    /// The end of another connection it ends as (see `server::Builder::relayed_end`), and
+    /// whether it closed.
     relayed_end: Option<RelayedEnd>,
-    relayed_go_aways: VecDeque<(u32, u32, Bytes, Vec<u32>)>,
     relayed_close: bool,
 
     /// The frames relayed to the peer after the deferred preface (see `Relay`), and those
     /// taken from it still to send.
     relay: Option<Relay>,
     relayed: VecDeque<RelayedFrame>,
+
+    /// The most streams the peer may open at once that the connection was built to accept,
+    /// past which relayed SETTINGS, and the deferred preface's, can't raise it.
+    max_concurrent_streams: Option<u32>,
 
     inner: ConnectionInner<P, B>,
 }
@@ -186,10 +189,10 @@ where
             codec,
             relay: config.deferred_preface.as_ref().map(DeferredPreface::relay),
             relayed: VecDeque::new(),
+            max_concurrent_streams: config.settings.max_concurrent_streams(),
             deferred_preface: config.deferred_preface,
             leave_close_to_client: config.leave_close_to_client,
             relayed_end: config.relayed_end,
-            relayed_go_aways: VecDeque::new(),
             relayed_close: false,
             inner: ConnectionInner {
                 state: State::Open,
@@ -333,6 +336,7 @@ where
             match self.relayed.pop_front().expect("a frame is relayed") {
                 RelayedFrame::Settings(params) => {
                     let mut settings = frame::Settings::default();
+                    let params = frame::sent_params(&params, self.max_concurrent_streams, false);
                     settings.set_wire(params).map_err(|_| {
                         Error::library_go_away_data(
                             Reason::INTERNAL_ERROR,
@@ -479,9 +483,7 @@ where
         }
 
         if let Some(relayed) = &self.relayed_end {
-            let (go_aways, close) = relayed.poll_take(cx);
-            self.relayed_go_aways.extend(go_aways);
-            self.relayed_close = close;
+            self.relayed_close = relayed.poll_close(cx);
         }
 
         loop {
@@ -499,14 +501,15 @@ where
                             // This will also handle flushing `self.codec`
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
-                            if let Some((last_stream_id, error_code, debug_data, refused)) =
-                                self.relayed_go_aways.pop_front()
+                            // Each relayed GOAWAY goes once the frames queued before it went.
+                            if let Some(go_away) =
+                                self.relayed_end.as_ref().and_then(RelayedEnd::take_go_away)
                             {
                                 self.inner.as_dyn().relay_go_away(
-                                    last_stream_id.into(),
-                                    error_code.into(),
-                                    debug_data,
-                                    &refused,
+                                    go_away.last_stream_id.into(),
+                                    go_away.error_code.into(),
+                                    go_away.debug_data,
+                                    &go_away.refused,
                                 );
                                 continue;
                             }
@@ -563,6 +566,7 @@ where
         for frame in frames {
             match frame {
                 PrefaceFrame::Settings(params) => {
+                    let params = frame::sent_params(&params, self.max_concurrent_streams, true);
                     settings.set_wire(params).map_err(|_| {
                         Error::library_go_away_data(
                             Reason::INTERNAL_ERROR,
@@ -723,7 +727,8 @@ where
         self.go_away.go_away(frame);
     }
 
-    /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`).
+    /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`), `refused`
+    /// sorted.
     fn relay_go_away(
         &mut self,
         last_stream_id: StreamId,
@@ -734,7 +739,7 @@ where
         // The latest stream the client opened that the other connection didn't leave
         // unprocessed went on regardless.
         let mut processed = self.streams.last_processed_id();
-        while processed > last_stream_id && refused.contains(&u32::from(processed)) {
+        while processed > last_stream_id && refused.binary_search(&u32::from(processed)).is_ok() {
             processed = StreamId::from(u32::from(processed).saturating_sub(2));
         }
         let last_stream_id = last_stream_id.max(processed);

@@ -25,6 +25,9 @@ pub struct Decoder {
     /// [`push_size_update`]), and the octets they took.
     size_updates: Vec<usize>,
     size_update_octets: usize,
+    /// Whether the header block being decoded had a field, past which it may have no
+    /// dynamic table size update (RFC 7541 §4.2).
+    block_has_field: bool,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -167,6 +170,7 @@ impl Decoder {
             buffer: BytesMut::with_capacity(4096),
             size_updates: Vec::new(),
             size_update_octets: 0,
+            block_has_field: false,
         }
     }
 
@@ -190,12 +194,23 @@ impl Decoder {
         self.max_size_update = Some(size);
     }
 
-    /// Decodes the headers found in the given buffer, telling of each how it went: a
-    /// pseudo-header can't say it came as a never-indexed literal itself, as a field's
-    /// sensitive value does.
-    pub fn decode<F>(
+    /// Decodes the headers found in the given buffer, a whole header block.
+    #[cfg(any(test, fuzzing))]
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header, FieldRepresentation) -> ControlFlow<()>,
+    {
+        self.decode_fragment(src, true, f)
+    }
+
+    /// Decodes the headers found in a header block's next fragment, its first when
+    /// `first`, telling of each how it went: a pseudo-header can't say it came as a
+    /// never-indexed literal itself, as a field's sensitive value does. Dynamic table
+    /// size updates may only open the block, whichever fragments carry them.
+    pub fn decode_fragment<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
+        first: bool,
         mut f: F,
     ) -> Result<(), DecoderError>
     where
@@ -203,7 +218,9 @@ impl Decoder {
     {
         use self::Representation::*;
 
-        let mut can_resize = true;
+        if first {
+            self.block_has_field = false;
+        }
 
         if let Some(size) = self.max_size_update.take() {
             self.last_max_update = size;
@@ -221,7 +238,7 @@ impl Decoder {
             match Representation::load(ty)? {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (index, entry) = self.decode_indexed(src)?;
                     consume(src);
                     if f(entry, FieldRepresentation::Indexed(index)).is_break() {
@@ -230,7 +247,7 @@ impl Decoder {
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Incremental)?;
 
@@ -244,7 +261,7 @@ impl Decoder {
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Without)?;
                     consume(src);
@@ -254,7 +271,7 @@ impl Decoder {
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (mut entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Never)?;
                     consume(src);
@@ -270,7 +287,7 @@ impl Decoder {
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
+                    if self.block_has_field {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 

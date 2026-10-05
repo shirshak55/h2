@@ -339,9 +339,11 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        // Bounded by the buffer's initial capacity, not its current one: a frame copied in
+        // past that (HEADERS, SETTINGS, a relayed frame) grows the buffer for good. The
+        // octets written stay counted until all went.
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && self.buf.get_ref().len() + self.min_buffer_capacity <= DEFAULT_BUFFER_CAPACITY
     }
 
     fn is_empty(&self) -> bool {

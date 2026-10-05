@@ -59,6 +59,35 @@ pub const MAX_MAX_FRAME_SIZE: FrameSize = (1 << 24) - 1;
 const MAX_WIRE_HEADER_LIST_SIZE: u32 = 16 << 20;
 const MAX_WIRE_HEADER_TABLE_SIZE: u32 = 1 << 20;
 
+/// The parameters a connection sends, and applies, for `params`, a SETTINGS frame it
+/// relays or its deferred preface's (`preface`): as given, but HEADER_TABLE_SIZE and
+/// MAX_HEADER_LIST_SIZE past the most `set_wire` applies, and MAX_CONCURRENT_STREAMS past
+/// `max_concurrent_streams`, as those, which a preface's also gets when it has none.
+pub(crate) fn sent_params(
+    params: &[(u16, u32)],
+    max_concurrent_streams: Option<u32>,
+    preface: bool,
+) -> Vec<(u16, u32)> {
+    let mut sent: Vec<(u16, u32)> = params
+        .iter()
+        .map(|&(id, value)| {
+            let max = match id {
+                1 => Some(MAX_WIRE_HEADER_TABLE_SIZE),
+                3 => max_concurrent_streams,
+                6 => Some(MAX_WIRE_HEADER_LIST_SIZE),
+                _ => None,
+            };
+            (id, max.map_or(value, |max| value.min(max)))
+        })
+        .collect();
+    if let Some(max) = max_concurrent_streams {
+        if preface && !params.iter().any(|&(id, _)| id == 3) {
+            sent.push((3, max));
+        }
+    }
+    sent
+}
+
 // ===== impl Settings =====
 
 impl Settings {
@@ -95,6 +124,11 @@ impl Settings {
             .map(|size| size.min(MAX_WIRE_HEADER_LIST_SIZE));
         self.wire = Some(params);
         Ok(())
+    }
+
+    /// Drops the parameters `set_wire` gave it to encode, keeping the values it applies.
+    pub(crate) fn clear_wire(&mut self) {
+        self.wire = None;
     }
 
     pub fn initial_window_size(&self) -> Option<u32> {

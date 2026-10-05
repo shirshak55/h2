@@ -595,14 +595,15 @@ impl<B> DynStreams<'_, B> {
 
     /// Refuses each open stream the peer opened past `last_processed_id`, which a GOAWAY
     /// naming it tells the peer went unprocessed, closing it with no RST_STREAM, and each
-    /// one of `unprocessed` at or below it with RST_STREAM(REFUSED_STREAM).
+    /// one of `unprocessed` (sorted) at or below it with RST_STREAM(REFUSED_STREAM).
     pub fn refuse(&mut self, last_processed_id: StreamId, unprocessed: &[u32]) {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
         let peer = me.counts.peer();
         let mut refused = Vec::new();
         me.store.for_each(|stream| {
-            if (stream.id > last_processed_id || unprocessed.contains(&u32::from(stream.id)))
+            if (stream.id > last_processed_id
+                || unprocessed.binary_search(&u32::from(stream.id)).is_ok())
                 && !peer.is_local_init(stream.id)
                 && !stream.state.is_closed()
             {

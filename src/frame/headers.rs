@@ -276,13 +276,16 @@ impl Headers {
         Ok((headers, src))
     }
 
+    /// Decodes the header block's next fragment, its first when `first`.
     pub fn load_hpack(
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        self.header_block
+            .load(src, max_header_list_size, decoder, first)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -592,13 +595,16 @@ impl PushPromise {
         Ok((frame, src))
     }
 
+    /// Decodes the header block's next fragment, its first when `first`.
     pub fn load_hpack(
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        self.header_block
+            .load(src, max_header_list_size, decoder, first)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1033,6 +1039,7 @@ impl HeaderBlock {
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;
@@ -1089,7 +1096,7 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header, representation| {
+        let res = decoder.decode_fragment(&mut cursor, first, |header, representation| {
             use crate::hpack::Header::*;
 
             use crate::ext::LiteralIndexing;
@@ -1574,7 +1581,12 @@ mod test {
         let mut decoder = hpack::Decoder::new(4096);
         const DEFAULT_MAX_HEADER_LIST_SIZE: usize = 16 << 20; // 16 MB
         headers
-            .load_hpack(&mut hpack_data, DEFAULT_MAX_HEADER_LIST_SIZE, &mut decoder)
+            .load_hpack(
+                &mut hpack_data,
+                DEFAULT_MAX_HEADER_LIST_SIZE,
+                &mut decoder,
+                true,
+            )
             .expect("load_hpack should return Ok");
 
         // Verify that is_over_size was set (try_append returned Err)

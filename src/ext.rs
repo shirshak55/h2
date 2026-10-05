@@ -36,6 +36,13 @@ impl Protocol {
             value: BytesStr::try_from(bytes)?,
         })
     }
+
+    /// Whether it is a token (RFC 9110 §5.6.2), as a `:protocol` value must be (RFC 8441
+    /// §4).
+    pub(crate) fn is_token(&self) -> bool {
+        let tchar = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+        !self.as_str().is_empty() && self.as_str().bytes().all(tchar)
+    }
 }
 
 impl<'a> From<&'a str> for Protocol {
@@ -97,7 +104,8 @@ struct FrameLogInner {
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<LoggedFrame>>,
     /// Called with every frame logged from now on (see [`FrameLog::on_frame`]).
     hooks: Vec<FrameHook>,
-    /// Ready once the connection may read the next frame (see [`FrameLog::gate_reads`]).
+    /// Ready once the connection may read the next frame but DATA (see
+    /// [`FrameLog::gate_reads`]).
     gate: Option<ReadGate>,
     /// The streams of the latest requests the connection didn't hand over, oldest first,
     /// and the hooks called with each from now on (see [`FrameLog::on_unhandled`]).
@@ -223,10 +231,12 @@ impl FrameLog {
         self.lock().hooks.push(FrameHook(Arc::new(hook)));
     }
 
-    /// Has the connection read each next frame only once `room` is ready, from now on, in
-    /// place of the one given before: a caller passing the frames on as they arrive (see
-    /// [`Self::subscribe`]) holds the client back while it lags, as the peer it passes
-    /// them to would, rather than having them queue without bound.
+    /// Has the connection read each next frame but DATA only once `room` is ready, from
+    /// now on, in place of the one given before: a caller passing the frames on as they
+    /// arrive (see [`Self::subscribe`]) holds the client back while it lags, as the peer
+    /// it passes them to would, rather than having them queue without bound. DATA, which
+    /// the log doesn't pass on, goes by, bounded by flow control and the data received
+    /// and not yet released.
     pub fn gate_reads(
         &self,
         room: impl Fn(&mut Context<'_>) -> std::task::Poll<()> + Send + Sync + 'static,
@@ -234,7 +244,7 @@ impl FrameLog {
         self.lock().gate = Some(ReadGate(Arc::new(room)));
     }
 
-    /// Ready once the connection may read the next frame (see [`Self::gate_reads`]).
+    /// Ready once the connection may read the next frame but DATA (see [`Self::gate_reads`]).
     pub(crate) fn poll_gate(&self, cx: &mut Context<'_>) -> std::task::Poll<()> {
         let gate = self.lock().gate.clone();
         gate.map_or(std::task::Poll::Ready(()), |gate| (gate.0)(cx))
@@ -590,8 +600,24 @@ impl fmt::Debug for SendBodyLayout {
     }
 }
 
+/// The parameters a server connection taking a [`DeferredPreface`] sends, and enforces,
+/// for `params`: its preface's SETTINGS (`preface`, see [`PrefaceFrame::Settings`]), or one
+/// it relays ([`RelayedFrame::Settings`]). As given, but past the most it takes, as that:
+/// HEADER_TABLE_SIZE past 1 MiB, MAX_HEADER_LIST_SIZE past 16 MiB, and
+/// MAX_CONCURRENT_STREAMS past the most it was built to accept (`max_concurrent_streams`,
+/// see [`server::Builder::max_concurrent_streams`](crate::server::Builder::max_concurrent_streams)),
+/// which its preface's also gets when it has none. A caller relaying another peer's
+/// SETTINGS can tell from it where the client's diverge.
+pub fn sent_settings(
+    params: &[(u16, u32)],
+    max_concurrent_streams: Option<u32>,
+    preface: bool,
+) -> Vec<(u16, u32)> {
+    crate::frame::sent_params(params, max_concurrent_streams, preface)
+}
+
 /// A frame of a server's connection preface a [`DeferredPreface`] supplies: its SETTINGS,
-/// exactly as given, and the frames right after it.
+/// as given (but see [`sent_settings`]), and the frames right after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrefaceFrame {
@@ -658,12 +684,25 @@ pub struct RelayedEnd(Arc<Mutex<RelayedEndInner>>);
 
 #[derive(Debug, Default)]
 struct RelayedEndInner {
-    /// The GOAWAYs to send: their last stream id, error code and debug data, and the
-    /// client's streams the other connection carried that they leave unprocessed.
-    go_aways: Vec<(u32, u32, Bytes, Vec<u32>)>,
+    /// The GOAWAYs still to send, in order, at most [`RELAYED_GO_AWAYS`].
+    go_aways: VecDeque<RelayedGoAway>,
     close: bool,
     task: Option<Waker>,
 }
+
+/// A GOAWAY to send (see [`RelayedEnd::go_away`]): its last stream id, error code and
+/// debug data, and the client's streams the other connection carried that it leaves
+/// unprocessed, sorted.
+#[derive(Debug)]
+pub(crate) struct RelayedGoAway {
+    pub(crate) last_stream_id: u32,
+    pub(crate) error_code: u32,
+    pub(crate) debug_data: Bytes,
+    pub(crate) refused: Vec<u32>,
+}
+
+/// How many GOAWAYs a [`RelayedEnd`] holds unsent; one past them merges into the last.
+const RELAYED_GO_AWAYS: usize = 4;
 
 impl RelayedEnd {
     /// An end nothing was relayed of yet.
@@ -679,17 +718,37 @@ impl RelayedEnd {
     /// refused stream, and each open one past the stream it names, is refused
     /// (REFUSED_STREAM), as unprocessed. The connection then accepts no later stream, and
     /// stays open until [`Self::close`] or the client closes it.
+    ///
+    /// Each goes out once the frames queued before it went. Past four waiting so, a GOAWAY
+    /// merges into the last: that one then names the lower last stream id of the two, with
+    /// this one's error code and debug data, refusing the streams either refuses.
     pub fn go_away(
         &self,
         last_stream_id: u32,
         error_code: u32,
         debug_data: Bytes,
-        refused: Vec<u32>,
+        mut refused: Vec<u32>,
     ) {
+        refused.sort_unstable();
+        refused.dedup();
         let mut inner = self.lock();
-        inner
-            .go_aways
-            .push((last_stream_id, error_code, debug_data, refused));
+        let waiting = inner.go_aways.len();
+        match inner.go_aways.back_mut() {
+            Some(last) if waiting >= RELAYED_GO_AWAYS => {
+                last.last_stream_id = last.last_stream_id.min(last_stream_id);
+                last.error_code = error_code;
+                last.debug_data = debug_data;
+                last.refused.extend(refused);
+                last.refused.sort_unstable();
+                last.refused.dedup();
+            }
+            _ => inner.go_aways.push_back(RelayedGoAway {
+                last_stream_id,
+                error_code,
+                debug_data,
+                refused,
+            }),
+        }
         inner.wake();
     }
 
@@ -704,15 +763,16 @@ impl RelayedEnd {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The GOAWAYs to send, and whether to close once idle; `cx` is woken when more come.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn poll_take(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> (Vec<(u32, u32, Bytes, Vec<u32>)>, bool) {
+    /// Whether to close once idle and the GOAWAYs went; `cx` is woken when either changes.
+    pub(crate) fn poll_close(&self, cx: &mut Context<'_>) -> bool {
         let mut inner = self.lock();
         inner.task = Some(cx.waker().clone());
-        (std::mem::take(&mut inner.go_aways), inner.close)
+        inner.close
+    }
+
+    /// Takes the next GOAWAY to send, the connection having sent the frames queued before.
+    pub(crate) fn take_go_away(&self) -> Option<RelayedGoAway> {
+        self.lock().go_aways.pop_front()
     }
 }
 
@@ -754,8 +814,9 @@ impl DeferredPreface {
 #[non_exhaustive]
 pub enum RelayedFrame {
     /// A SETTINGS frame: `(identifier, value)` in order, unknown identifiers and repeats
-    /// included, whatever SETTINGS sent before await acknowledgement. The known parameters
-    /// apply to the connection as its own once the client acknowledges it.
+    /// included (but see [`sent_settings`]), whatever SETTINGS sent before await
+    /// acknowledgement. The known parameters apply to the connection as its own once the
+    /// client acknowledges it.
     Settings(Vec<(u16, u32)>),
     /// A PING carrying this payload.
     Ping([u8; 8]),
@@ -808,7 +869,7 @@ pub struct Relay(Arc<Mutex<RelayInner>>, FrameLog);
 #[derive(Debug, Default)]
 struct RelayInner {
     frames: VecDeque<RelayedFrame>,
-    /// The octets of the payloads of the unknown frames among them.
+    /// The octets of the payloads of the SETTINGS and unknown frames among them.
     octets: usize,
     task: Option<Waker>,
     /// The caller's task waiting for room (see [`Relay::poll_ready`]).
@@ -840,7 +901,7 @@ impl fmt::Debug for AckHook {
 }
 
 /// How many frames sent through a [`Relay`] await the connection at most, and the octets
-/// of the unknown frames' payloads among them, before it has no room (see
+/// of the SETTINGS and unknown frames' payloads among them, before it has no room (see
 /// [`Relay::poll_ready`]).
 const RELAYED_FRAMES: usize = 1024;
 const RELAYED_OCTETS: usize = 1 << 20;
@@ -856,17 +917,19 @@ impl Relay {
         if inner.closed {
             return;
         }
-        if let RelayedFrame::Unknown { payload, .. } = &frame {
-            inner.octets += payload.len();
-        }
+        inner.octets += match &frame {
+            RelayedFrame::Settings(params) => params.len() * 6,
+            RelayedFrame::Unknown { payload, .. } => payload.len(),
+            _ => 0,
+        };
         inner.frames.push_back(frame);
         inner.wake();
     }
 
     /// Ready once the frames sent (see [`Self::send`]) leave room for more, or the
-    /// connection ended: at most 1,024 of them, or 1 MiB of unknown frames' payloads, await
-    /// the connection, which takes them as the client reads what it sent before, so a
-    /// client slow to read holds the caller back rather than more frames.
+    /// connection ended: at most 1,024 of them, or 1 MiB of SETTINGS and unknown frames'
+    /// payloads, await the connection, which takes them as the client reads what it sent
+    /// before, so a client slow to read holds the caller back rather than more frames.
     pub fn poll_ready(&self, cx: &mut Context<'_>) -> std::task::Poll<()> {
         let mut inner = self.lock();
         if inner.closed || (inner.frames.len() < RELAYED_FRAMES && inner.octets < RELAYED_OCTETS) {

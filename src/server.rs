@@ -405,7 +405,12 @@ where
             codec.set_max_recv_frame_size(max as usize);
         }
 
-        if let Some(max) = builder.settings.max_header_list_size() {
+        // Beneath a deferred preface, the client is told none until the preface's SETTINGS.
+        if let Some(max) = builder
+            .settings
+            .max_header_list_size()
+            .filter(|_| builder.deferred_preface.is_none())
+        {
             codec.set_max_recv_header_list_size(max as usize);
         }
 
@@ -717,7 +722,11 @@ impl Builder {
     /// and sends nothing (no SETTINGS, ACK, WINDOW_UPDATE or response) until the preface
     /// arrives, which it then writes ahead of everything else. The connection window
     /// then grows only by the preface's WINDOW_UPDATE, not
-    /// [`initial_connection_window_size`](Self::initial_connection_window_size).
+    /// [`initial_connection_window_size`](Self::initial_connection_window_size), and the
+    /// client's header lists are bounded by the preface's SETTINGS once acknowledged, not
+    /// [`max_header_list_size`](Self::max_header_list_size). Its
+    /// [`max_concurrent_streams`](Self::max_concurrent_streams) still bounds the preface's
+    /// (see [`sent_settings`](crate::ext::sent_settings)).
     ///
     /// Lets a server reproduce another server's preface, once known.
     pub fn deferred_preface(&mut self, preface: crate::ext::DeferredPreface) -> &mut Self {
@@ -1789,10 +1798,12 @@ impl proto::Peer for Peer {
         }
 
         let has_protocol = pseudo.protocol.is_some();
-        if has_protocol {
-            if is_connect {
+        if let Some(protocol) = pseudo.protocol {
+            if !protocol.is_token() {
+                malformed!("malformed headers: :protocol not a token");
+            } else if is_connect {
                 // Assert that we have the right type.
-                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+                b = b.extension::<crate::ext::Protocol>(protocol);
             } else {
                 malformed!("malformed headers: :protocol on non-CONNECT request");
             }

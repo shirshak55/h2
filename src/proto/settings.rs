@@ -204,8 +204,10 @@ impl Settings {
         Ok(())
     }
 
-    /// Notes `frame`, a relayed SETTINGS frame just sent, which awaits its ACK.
-    pub(crate) fn sent_relayed(&mut self, frame: frame::Settings) {
+    /// Notes `frame`, a relayed SETTINGS frame just sent, which awaits its ACK: the values
+    /// it applies then, not its parameters as sent.
+    pub(crate) fn sent_relayed(&mut self, mut frame: frame::Settings) {
+        frame.clear_wire();
         self.waiting.push_back((frame, true));
     }
 
