@@ -409,7 +409,9 @@ where
                 }
             }
         }
-        // Woken as more frames are relayed (see `Relay::poll_take`).
+        self.inner.ping_pong.poll_expired(cx);
+        // Woken as more frames are relayed (see `Relay::poll_take`), or one of the client's
+        // PINGs no longer awaits its relayed ACK.
         if self.relayed.is_empty()
             && self.inner.ping_pong.is_awaiting_full()
             && self.inner.ping_pong.relayed_waiting() == 0
@@ -717,6 +719,9 @@ where
         let relays_acks = relay.relays_acks() && forwards;
         self.settings.set_relays_acks(relays_acks, forwards);
         self.ping_pong.set_relays_acks(relays_acks, forwards);
+        if relay.releases_pings() {
+            self.ping_pong.release_awaiting();
+        }
         relays_acks
     }
 

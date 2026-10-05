@@ -929,8 +929,10 @@ struct RelayInner {
     ready: Option<Waker>,
     on_ack: Option<AckHook>,
     /// Whether the client's SETTINGS and PINGs await relayed acknowledgements (see
-    /// [`Relay::relay_acks`]).
+    /// [`Relay::relay_acks`]), and whether its PINGs no longer do (see
+    /// [`Relay::release_pings`]).
     relays_acks: bool,
+    releases_pings: bool,
     /// The client's streams whose windows grow only by relayed WINDOW_UPDATEs from the
     /// data they release next on, each with whether the relaying peer is sent the padding
     /// they receive (see [`Relay::mirror_stream_window`]).
@@ -1042,6 +1044,18 @@ impl Relay {
         }
     }
 
+    /// Leaves the client's PINGs awaiting a relayed acknowledgement, and those it sends from
+    /// now on, unacknowledged, as the relaying peer left them, rather than have them hold
+    /// back its frames (see [`Self::relay_acks`]): the connection doesn't acknowledge them
+    /// itself, but an acknowledgement still relayed goes on.
+    pub fn release_pings(&self) {
+        let mut inner = self.lock();
+        inner.releases_pings = true;
+        if let Some(task) = inner.task.take() {
+            task.wake();
+        }
+    }
+
     /// Makes the receive window of the client's stream `stream_id` grow only by the
     /// relayed WINDOW_UPDATEs ([`RelayedFrame::WindowUpdate`]) from the data it releases
     /// next on, rather than by that data, as the relaying peer's window does once that data
@@ -1069,6 +1083,12 @@ impl Relay {
     /// Whether the client's SETTINGS and PINGs await relayed acknowledgements.
     pub(crate) fn relays_acks(&self) -> bool {
         self.lock().relays_acks
+    }
+
+    /// Whether the client's PINGs await relayed acknowledgements no longer (see
+    /// [`Self::release_pings`]).
+    pub(crate) fn releases_pings(&self) -> bool {
+        self.lock().releases_pings
     }
 
     /// Whether `stream_id`'s window was made to grow only by relayed WINDOW_UPDATEs since
