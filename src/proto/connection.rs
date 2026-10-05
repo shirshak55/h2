@@ -289,7 +289,9 @@ where
 
     /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
     /// went out, and the acknowledgements due of the client's SETTINGS and PINGs no longer
-    /// awaiting relayed ones.
+    /// awaiting relayed ones; pending, so that the connection reads no more of the client's
+    /// frames, while as many of its PINGs as may await relayed ACKs do, unless the frames
+    /// relayed wait for its own ACKs.
     fn poll_relay(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         let Some(relay) = &self.relay else {
             return Poll::Ready(Ok(()));
@@ -406,6 +408,10 @@ where
                     }
                 }
             }
+        }
+        // Woken as more frames are relayed (see `Relay::poll_take`).
+        if self.relayed.is_empty() && self.inner.ping_pong.is_awaiting_full() {
+            return Poll::Pending;
         }
         Poll::Ready(Ok(()))
     }

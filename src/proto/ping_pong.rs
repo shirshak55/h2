@@ -61,8 +61,9 @@ pub(crate) enum ReceivedPing {
     AwaitsRelayedAck,
 }
 
-/// How many of the remote's PINGs may await relayed ACKs; past them the connection
-/// acknowledges a PING itself, so a remote flooding PINGs holds no more.
+/// How many of the remote's PINGs may await relayed ACKs: while as many do, the connection
+/// reads no more of its frames (see `PingPong::is_awaiting_full`), and acknowledges itself
+/// one it reads all the same.
 const MAX_AWAITING: usize = 1024;
 
 /// No user ping pending.
@@ -128,6 +129,11 @@ impl PingPong {
             .iter()
             .find(|(_, acked)| !acked)
             .map(|(payload, _)| *payload)
+    }
+
+    /// Whether as many of the remote's PINGs as may await relayed ACKs do.
+    pub(crate) fn is_awaiting_full(&self) -> bool {
+        self.unacked >= MAX_AWAITING
     }
 
     /// Notes that the remote's earliest PING awaiting a relayed ACK is acknowledged.
@@ -210,7 +216,7 @@ impl PingPong {
             // so for resiliency, just ignore it for now.
             tracing::warn!("recv PING ack that we never sent: {:?}", ping);
             ReceivedPing::Unknown
-        } else if self.relays_acks && self.awaiting.len() < MAX_AWAITING {
+        } else if self.relays_acks && !self.is_awaiting_full() {
             self.awaiting.push_back((ping.into_payload(), false));
             self.unacked += 1;
             ReceivedPing::AwaitsRelayedAck
