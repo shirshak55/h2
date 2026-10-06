@@ -369,6 +369,13 @@ impl<B: Buf> SendStream<B> {
         self.inner.send_reset(reason)
     }
 
+    /// Polls until fewer than 1,024 frames wait on the stream to be handed to the
+    /// connection, so that frames sent without capacity, as empty DATA frames, aren't
+    /// queued without bound toward a peer that reads none of them.
+    pub fn poll_queue_room(&mut self, cx: &mut Context) -> Poll<()> {
+        self.inner.poll_queue_room(cx)
+    }
+
     /// Polls to be notified when the client resets this stream.
     ///
     /// If stream is still open, this returns `Poll::Pending`, and

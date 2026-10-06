@@ -1726,6 +1726,19 @@ impl<B> StreamRef<B> {
         me.actions.send.poll_reset(cx, &mut stream, mode)
     }
 
+    /// Ready once fewer than [`proto::MAX_QUEUED_FRAMES`] frames are queued on the stream.
+    pub fn poll_queue_room(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        if stream.pending_send.len() < proto::MAX_QUEUED_FRAMES {
+            return Poll::Ready(());
+        }
+        stream.wait_send(cx);
+        Poll::Pending
+    }
+
     /// Ready once the frames queued on the stream have all been handed to the connection
     /// to write, so a frame queued afterwards on another stream goes out after them, or once
     /// they wait for the stream to be opened, which waits on other streams closing.

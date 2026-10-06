@@ -18,6 +18,9 @@ pub struct Data<T = Bytes> {
     /// The frames it goes as, when not as one carrying it unpadded (see
     /// `ext::SendBodyLayout`).
     plan: VecDeque<PlannedFrame>,
+    /// Whether, received, its body's frames (see `ext::BodyFrames`) didn't keep it, so its
+    /// padding goes nowhere.
+    padding_unrecorded: bool,
 }
 
 /// A frame a DATA frame's data goes in (see `Data::plan_mut`).
@@ -47,6 +50,7 @@ impl<T> Data<T> {
             flags: DataFlags::default(),
             pad_len: None,
             plan: VecDeque::new(),
+            padding_unrecorded: false,
         }
     }
 
@@ -129,6 +133,16 @@ impl<T> Data<T> {
         self.pad_len.map_or(0, |pad_len| usize::from(pad_len) + 1)
     }
 
+    /// Whether, received, its body's frames didn't keep it, so its padding goes nowhere.
+    pub(crate) fn is_padding_unrecorded(&self) -> bool {
+        self.padding_unrecorded
+    }
+
+    /// Tells that, received, its body's frames didn't keep it.
+    pub(crate) fn set_padding_unrecorded(&mut self) {
+        self.padding_unrecorded = true;
+    }
+
     /// The frames it goes as, in order; when empty, as one carrying it unpadded.
     pub(crate) fn plan_mut(&mut self) -> &mut VecDeque<PlannedFrame> {
         &mut self.plan
@@ -157,6 +171,7 @@ impl<T> Data<T> {
             flags: self.flags,
             pad_len: self.pad_len,
             plan: self.plan,
+            padding_unrecorded: self.padding_unrecorded,
         }
     }
 }
@@ -183,6 +198,7 @@ impl Data<Bytes> {
             flags,
             pad_len,
             plan: VecDeque::new(),
+            padding_unrecorded: false,
         })
     }
 
@@ -208,6 +224,7 @@ mod tests {
             flags: DataFlags::default(),
             pad_len,
             plan: VecDeque::new(),
+            padding_unrecorded: false,
         }
     }
 

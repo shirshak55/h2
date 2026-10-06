@@ -502,7 +502,9 @@ fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
         Frame::Data(f) => {
             let kept = log.kept_body(f.stream_id().into(), f.is_end_stream());
             if let Some(body) = kept.as_ref().and_then(BodyFrames::upgrade) {
-                body.push_data(f.payload().len(), f.pad_len(), f.is_end_stream());
+                if !body.push_data(f.payload().len(), f.pad_len(), f.is_end_stream()) {
+                    f.set_padding_unrecorded();
+                }
             }
             None
         }

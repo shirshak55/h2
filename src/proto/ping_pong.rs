@@ -31,6 +31,9 @@ pub(crate) struct PingPong {
     awaiting: VecDeque<(PingPayload, Awaiting)>,
     /// How many of those are due.
     unacked: usize,
+    /// How many of those awaiting none any longer, unacknowledged, went unkept to bound
+    /// those kept: as many relayed ACKs of none kept still go on.
+    unkept_released: usize,
     /// Whether none awaits a relayed ACK any longer (see `Relay::release_pings`).
     released: bool,
     /// When the earliest due one is no longer.
@@ -82,8 +85,8 @@ pub(crate) enum ReceivedPing {
 }
 
 /// How many of the remote's PINGs may await relayed ACKs: while as many do, the connection
-/// reads no more of its frames (see `PingPong::is_awaiting_full`), and acknowledges itself
-/// one it reads all the same.
+/// reads no more of its frames (see `PingPong::is_awaiting_full`), and leaves one it reads
+/// all the same awaiting none, its relayed ACK still going on.
 const MAX_AWAITING: usize = 1024;
 
 /// How long one of the remote's PINGs awaits a relayed ACK at most, far longer than a peer
@@ -115,6 +118,7 @@ impl PingPong {
             forwards: false,
             awaiting: VecDeque::new(),
             unacked: 0,
+            unkept_released: 0,
             released: false,
             expiry: None,
         }
@@ -136,7 +140,12 @@ impl PingPong {
             .iter()
             .position(|(awaiting, _)| awaiting == payload)
         else {
-            return false;
+            // One of those awaiting none any longer that went unkept, as far as any did.
+            if self.unkept_released == 0 {
+                return false;
+            }
+            self.unkept_released -= 1;
+            return true;
         };
         match self.awaiting.remove(index).map(|(_, state)| state) {
             Some(Awaiting::Due(_)) => {
@@ -288,12 +297,17 @@ impl PingPong {
             // so for resiliency, just ignore it for now.
             tracing::warn!("recv PING ack that we never sent: {:?}", ping);
             ReceivedPing::Unknown
-        } else if self.relays_acks && !self.is_awaiting_full() {
+        } else if self.relays_acks {
             if !self.released {
-                let until = Instant::now() + PING_ACK_WAIT;
-                self.awaiting
-                    .push_back((ping.into_payload(), Awaiting::Due(until)));
-                self.unacked += 1;
+                // One read past as many as may await relayed ACKs (see
+                // `Connection::poll_relay`) awaits none, left unacknowledged here.
+                let state = if self.is_awaiting_full() {
+                    Awaiting::Released
+                } else {
+                    self.unacked += 1;
+                    Awaiting::Due(Instant::now() + PING_ACK_WAIT)
+                };
+                self.awaiting.push_back((ping.into_payload(), state));
                 // Those no longer due go first.
                 if self.awaiting.len() > 2 * MAX_AWAITING {
                     if let Some(at) = self
@@ -301,7 +315,9 @@ impl PingPong {
                         .iter()
                         .position(|(_, state)| !matches!(state, Awaiting::Due(_)))
                     {
-                        self.awaiting.remove(at);
+                        if let Some((_, Awaiting::Released)) = self.awaiting.remove(at) {
+                            self.unkept_released += 1;
+                        }
                     }
                 }
             }

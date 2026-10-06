@@ -927,10 +927,16 @@ impl Recv {
             let _res = self.release_capacity(padding, stream, &mut None);
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
-            // Padding the relaying peer isn't sent grows the windows here.
+            // Padding the relaying peer isn't sent grows the windows here, that of a frame
+            // its body's frames didn't keep among it.
+            let unrecorded = frame.is_padding_unrecorded();
             if !stream.recv_flow.is_mirror() {
-                stream.unmirrored_padding = stream.unmirrored_padding.saturating_add(padding);
-            } else if !stream.relays_padding {
+                if unrecorded {
+                    stream.unmirrored = stream.unmirrored.saturating_sub(padding);
+                } else {
+                    stream.unmirrored_padding = stream.unmirrored_padding.saturating_add(padding);
+                }
+            } else if !stream.relays_padding || unrecorded {
                 self.release_mirrored_padding(padding, stream, &mut None);
             }
         }

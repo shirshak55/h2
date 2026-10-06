@@ -382,6 +382,19 @@ where
                             .expect("invalid window update frame");
                     }
                 }
+                RelayedFrame::Priority {
+                    stream_id,
+                    priority,
+                } => {
+                    let mut frame = BytesMut::with_capacity(frame::HEADER_LEN + 5);
+                    frame.put_uint(5, 3);
+                    frame.put_u8(frame::Kind::Priority as u8);
+                    frame.put_u8(0);
+                    frame.put_u32(stream_id);
+                    frame.put_u32(priority.dependency | u32::from(priority.exclusive) << 31);
+                    frame.put_u8(priority.weight);
+                    self.codec.buffer_raw(&frame);
+                }
                 RelayedFrame::Unknown {
                     kind,
                     flags,

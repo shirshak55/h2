@@ -1082,6 +1082,9 @@ impl Prioritize {
                     if stream.pending_send.is_empty() {
                         stream.notify_flushed();
                     }
+                    if stream.pending_send.len() + 1 == MAX_QUEUED_FRAMES {
+                        stream.notify_send();
+                    }
 
                     counts.transition_after(stream, is_pending_reset);
 

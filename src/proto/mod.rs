@@ -38,6 +38,9 @@ pub const DEFAULT_LOCAL_RESET_COUNT_MAX: usize = 1024;
 pub const DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD: usize = 256;
 pub const DEFAULT_DATA_FRAME_BUDGET: usize = DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 100;
 pub const MAX_RECV_EMPTY_DATA_FRAMES: usize = 100;
+// How many frames a stream queues before `SendStream::poll_queue_room` waits for them to
+// go: frames needing no capacity, as empty DATA frames, are otherwise queued without bound.
+pub const MAX_QUEUED_FRAMES: usize = 1024;
 // RFC 9113 suggests allowing at minimum 100 streams, it seems reasonable to
 // by default allow a portion of that to be remembered as reset for some time.
 pub const DEFAULT_RESET_STREAM_MAX: usize = 50;

@@ -10,6 +10,7 @@ pub struct Buffer<T> {
 #[derive(Debug)]
 pub struct Deque {
     indices: Option<Indices>,
+    len: usize,
 }
 
 /// Tracks the head & tail for a sequence of frames in a `Buffer`.
@@ -37,15 +38,23 @@ impl<T> Buffer<T> {
 
 impl Deque {
     pub fn new() -> Self {
-        Deque { indices: None }
+        Deque {
+            indices: None,
+            len: 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.indices.is_none()
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn push_back<T>(&mut self, buf: &mut Buffer<T>, value: T) {
         let key = buf.slab.insert(Slot { value, next: None });
+        self.len += 1;
 
         match self.indices {
             Some(ref mut idxs) => {
@@ -63,6 +72,7 @@ impl Deque {
 
     pub fn push_front<T>(&mut self, buf: &mut Buffer<T>, value: T) {
         let key = buf.slab.insert(Slot { value, next: None });
+        self.len += 1;
 
         match self.indices {
             Some(ref mut idxs) => {
@@ -82,6 +92,7 @@ impl Deque {
         match self.indices {
             Some(mut idxs) => {
                 let mut slot = buf.slab.remove(idxs.head);
+                self.len -= 1;
 
                 if idxs.head == idxs.tail {
                     assert!(slot.next.is_none());
