@@ -196,6 +196,9 @@ pub struct Handshake<T, B: Buf = Bytes> {
 #[must_use = "streams do nothing unless polled"]
 pub struct Connection<T, B: Buf> {
     connection: proto::Connection<T, Peer, B>,
+    /// The error the connection ended with, while the requests received before it still go
+    /// to the caller (see [`Connection::poll_accept`]).
+    ended: Option<crate::Error>,
 }
 
 /// Builds server connections with custom configuration values.
@@ -463,14 +466,26 @@ where
     ) -> Poll<Option<Result<(Request<RecvStream>, SendResponse<B>), crate::Error>>> {
         // Always try to advance the internal state. Getting Pending also is
         // needed to allow this function to return Pending.
-        if self.poll_closed(cx)?.is_ready() {
-            // If the socket is closed, don't return anything
-            // TODO: drop any pending streams
-            return Poll::Ready(None);
-        }
-
-        if let Some(inner) = self.connection.next_incoming() {
+        let closed = match self.ended.take() {
+            Some(error) => Poll::Ready(Err(error)),
+            None => self.poll_closed(cx),
+        };
+        // The requests received before its transport ended still go, ahead of its end,
+        // unless its peer reset it.
+        let incoming = match &closed {
+            Poll::Ready(Err(error)) => match error.get_io().map(std::io::Error::kind) {
+                Some(kind) if kind != std::io::ErrorKind::ConnectionReset => {
+                    self.connection.next_incoming()
+                }
+                _ => None,
+            },
+            _ => self.connection.next_incoming(),
+        };
+        if let Some(inner) = incoming {
             tracing::trace!("received incoming");
+            if let Poll::Ready(Err(error)) = closed {
+                self.ended = Some(error);
+            }
             let (head, _) = inner.take_request().into_parts();
             let body = RecvStream::new(FlowControl::new(inner.clone_to_opaque()));
 
@@ -480,7 +495,9 @@ where
             return Poll::Ready(Some(Ok((request, respond))));
         }
 
-        Poll::Pending
+        // If the socket is closed, don't return anything
+        ready!(closed)?;
+        Poll::Ready(None)
     }
 
     /// Sets the target window size for the whole connection.
@@ -1649,7 +1666,10 @@ where
                     );
 
                     tracing::trace!("connection established!");
-                    let mut c = Connection { connection };
+                    let mut c = Connection {
+                        connection,
+                        ended: None,
+                    };
                     if let Some(sz) = self.builder.initial_target_connection_window_size {
                         if !deferred {
                             c.set_target_window_size(sz);
