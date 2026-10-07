@@ -70,6 +70,11 @@ pub(super) struct Recv {
     /// [`Self::relayed_connection_increment`]).
     relay_repaid: u64,
 
+    /// The window the connection announced for data the client's streams released before
+    /// they were mirrored, which the relayed connection WINDOW_UPDATEs still keep back (see
+    /// [`Self::mirror_released`]).
+    mirror_announced: u64,
+
     /// Whether the WINDOW_UPDATEs due wait for a deferred preface, which no frame goes
     /// ahead of: the windows they would grow may yet come to grow only by the relaying
     /// peer's (see `Stream::mirror_window`).
@@ -140,6 +145,7 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             mirror_covered: 0,
             relay_repaid: 0,
+            mirror_announced: 0,
             windows_held: false,
         }
     }
@@ -648,21 +654,25 @@ impl Recv {
 
     /// Grows the connection's window by `octets` of the data the client's mirrored streams
     /// released that the relaying peer, their streams reset, wasn't sent (see
-    /// `Relay::give_back`).
+    /// `Relay::give_back`), less the window it announced ahead for such data still to be
+    /// kept back (see `Self::mirror_released`).
     pub fn give_back(&mut self, octets: u64, task: &mut Option<Waker>) {
         let octets = octets.min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
         if octets == 0 {
             return;
         }
-        self.assign_connection_capacity(octets, task);
+        let announced = self.mirror_announced.min(u64::from(octets));
+        self.mirror_announced -= announced;
+        self.assign_connection_capacity(octets - announced as WindowSize, task);
         self.mirror_covered -= u64::from(octets);
     }
 
-    /// Takes back the window the connection gave itself, as far as not yet announced, for
-    /// `octets` of data the client's `stream` released before it was mirrored (see
-    /// `Stream::mirror_window`), which the relaying peer was sent and so grants: the part
-    /// taken back counts as released mirrored, so that the stream, reset, gives back what
-    /// of it that peer wasn't sent after all.
+    /// Takes back the window the connection gave itself for `octets` of data the client's
+    /// `stream` released before it was mirrored (see `Stream::mirror_window`), which the
+    /// relaying peer was sent and so grants: as far as not yet announced at once, the rest
+    /// from the relayed connection WINDOW_UPDATEs to come. All of it counts as released
+    /// mirrored, so that the stream, reset, gives back what of it that peer wasn't sent
+    /// after all.
     pub fn mirror_released(&mut self, stream: &mut Stream, octets: WindowSize) {
         let unannounced = self
             .flow
@@ -672,16 +682,18 @@ impl Recv {
         let cancelled = unannounced.min(octets);
         let _res = self.flow.claim_capacity(cancelled);
         debug_assert!(_res.is_ok());
-        self.mirror_covered += u64::from(cancelled);
-        stream.mirrored_taken += u64::from(cancelled);
-        stream.mirror_unacked = stream.mirror_unacked.saturating_add(cancelled);
+        self.mirror_announced += u64::from(octets - cancelled);
+        self.mirror_covered += u64::from(octets);
+        stream.mirrored_taken += u64::from(octets);
+        stream.mirror_unacked = stream.mirror_unacked.saturating_add(octets);
     }
 
     /// The part of a relayed connection WINDOW_UPDATE's `increment` that grows the
     /// connection's window, the relaying peer having been sent `peer_sent` octets of data
     /// (see `Relay::set_peer_sent`): the rest repays its grants for the data the client's
     /// mirrored streams didn't send it, whose window the connection gave itself as the
-    /// client sent theirs, or never shrank.
+    /// client sent theirs, or never shrank, and then the window it announced for data they
+    /// released before they were mirrored (see `Self::mirror_released`).
     pub fn relayed_connection_increment(
         &mut self,
         increment: WindowSize,
@@ -702,7 +714,10 @@ impl Recv {
         }
         let repaid = (owed - u64::from(cancelled)).min(u64::from(increment)) as WindowSize;
         self.relay_repaid += u64::from(cancelled + repaid);
-        increment - repaid
+        let increment = increment - repaid;
+        let announced = self.mirror_announced.min(u64::from(increment)) as WindowSize;
+        self.mirror_announced -= u64::from(announced);
+        increment - announced
     }
 
     /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
