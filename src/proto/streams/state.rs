@@ -301,7 +301,7 @@ impl State {
             Closed(..) => {}
             _ => {
                 tracing::trace!("handle_error; err={:?}", err);
-                self.inner = Closed(Cause::Error(err.clone()));
+                self.inner = Closed(self.error_cause(err.clone()));
             }
         }
     }
@@ -311,14 +311,26 @@ impl State {
             Closed(..) => {}
             ref state => {
                 tracing::trace!("recv_eof; state={:?}", state);
-                self.inner = Closed(Cause::Error(
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "stream closed because of a broken pipe",
-                    )
-                    .into(),
-                ));
+                self.inner = Closed(
+                    self.error_cause(
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "stream closed because of a broken pipe",
+                        )
+                        .into(),
+                    ),
+                );
             }
+        }
+    }
+
+    /// Why it closes with `error`: past the END_STREAM it received, if it did, which its
+    /// receive half keeps, as at a received reset.
+    fn error_cause(&self, error: Error) -> Cause {
+        if self.is_recv_end_stream() {
+            Cause::ErrorAfterEndStream(error)
+        } else {
+            Cause::Error(error)
         }
     }
 

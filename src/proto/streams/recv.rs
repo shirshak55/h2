@@ -659,9 +659,11 @@ impl Recv {
     }
 
     /// Takes back the window the connection gave itself, as far as not yet announced, for
-    /// `octets` of data a client's stream released before it was mirrored (see
-    /// `Stream::mirror_window`), which the relaying peer was sent and so grants.
-    pub fn mirror_released(&mut self, octets: WindowSize) {
+    /// `octets` of data the client's `stream` released before it was mirrored (see
+    /// `Stream::mirror_window`), which the relaying peer was sent and so grants: the part
+    /// taken back counts as released mirrored, so that the stream, reset, gives back what
+    /// of it that peer wasn't sent after all.
+    pub fn mirror_released(&mut self, stream: &mut Stream, octets: WindowSize) {
         let unannounced = self
             .flow
             .available()
@@ -671,6 +673,8 @@ impl Recv {
         let _res = self.flow.claim_capacity(cancelled);
         debug_assert!(_res.is_ok());
         self.mirror_covered += u64::from(cancelled);
+        stream.mirrored_taken += u64::from(cancelled);
+        stream.mirror_unacked = stream.mirror_unacked.saturating_add(cancelled);
     }
 
     /// The part of a relayed connection WINDOW_UPDATE's `increment` that grows the

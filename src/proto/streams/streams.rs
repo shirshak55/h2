@@ -186,7 +186,7 @@ where
             Some(mut stream) if !stream.state.is_closed() => {
                 let relays_padding = stream.relays_padding;
                 let sent = stream.mirror_window(relays_padding);
-                me.actions.recv.mirror_released(sent);
+                me.actions.recv.mirror_released(&mut stream, sent);
                 let repaid = increment.min(stream.unmirrored);
                 stream.unmirrored -= repaid;
                 let increment = increment - repaid;
@@ -216,7 +216,7 @@ where
         let me = &mut *me;
         if let Some(mut stream) = me.store.find_mut(&id) {
             let sent = stream.mirror_window(relays_padding);
-            me.actions.recv.mirror_released(sent);
+            me.actions.recv.mirror_released(&mut stream, sent);
         }
     }
 
@@ -668,7 +668,8 @@ impl Inner {
             .as_ref()
             .and_then(|relay| relay.take_mirrored(stream.id.into()))
         {
-            recv.mirror_released(stream.mirror_window(relays_padding));
+            let sent = stream.mirror_window(relays_padding);
+            recv.mirror_released(stream, sent);
         }
     }
 
