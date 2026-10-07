@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::UserError;
-use crate::ext::HeaderOrder;
+use crate::ext::{HeaderOrder, Refund, Relay, RelayedBody};
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
 
@@ -290,6 +290,7 @@ impl Recv {
                 .peer()
                 .convert_poll_message(pseudo, fields, order, stream_id)?;
             if let (peer::PollMessage::Server(req), Some(received)) = (&mut message, received) {
+                stream.relayed_body = Some(received.body.relayed());
                 req.extensions_mut().insert(received);
             }
 
@@ -531,6 +532,7 @@ impl Recv {
         if capacity > stream.in_flight_recv_data {
             return Err(UserError::ReleaseCapacityTooBig);
         }
+        stream.take_data(capacity);
 
         if stream.recv_flow.is_mirror() {
             // The relayed peer's WINDOW_UPDATEs grow the windows instead.
@@ -579,6 +581,8 @@ impl Recv {
         }
         stream.mirror_unacked -= padding;
         self.mirror_covered -= u64::from(padding);
+        stream.data_taken = stream.data_taken.saturating_sub(u64::from(padding));
+        stream.mirrored_taken = stream.mirrored_taken.saturating_sub(u64::from(padding));
         // TODO: proper error handling
         let _res = self.flow.assign_capacity(padding);
         debug_assert!(_res.is_ok());
@@ -592,10 +596,12 @@ impl Recv {
         }
     }
 
-    /// Release any unclaimed capacity for a closed stream.
+    /// Release any unclaimed capacity for a closed stream, `relay` relaying the data it
+    /// released.
     pub fn release_closed_capacity(
         &mut self,
         stream: &mut store::Ptr,
+        relay: Option<&Relay>,
         task: &mut Option<Waker>,
         counts: &mut Counts,
     ) {
@@ -613,15 +619,43 @@ impl Recv {
         }
 
         // A reset may drop data released last on its way to the relaying peer, who then
-        // never grows the connection's window by it: it grows here by the data that peer's
-        // WINDOW_UPDATEs on the stream didn't cover, which holds it.
+        // never grows the connection's window by it: it grows here by the data released
+        // that peer wasn't sent, once how far the body went is known (see
+        // `BodyFrames::relay_sent`), else by the data that peer's WINDOW_UPDATEs on the
+        // stream didn't cover, which holds it.
+        let relayed = stream.relayed_body.take();
         if stream.recv_flow.is_mirror() && stream.state.is_reset() && stream.mirror_unacked != 0 {
-            self.assign_connection_capacity(stream.mirror_unacked, task);
-            self.mirror_covered -= u64::from(stream.mirror_unacked);
-            stream.mirror_unacked = 0;
+            let unacked = std::mem::take(&mut stream.mirror_unacked);
+            let octets = match (relay, relayed) {
+                (Some(relay), Some(relayed)) => RelayedBody::refund(
+                    &relayed,
+                    Refund {
+                        data_taken: stream.data_taken,
+                        mirrored_taken: stream.mirrored_taken,
+                        unacked,
+                        relay: relay.clone(),
+                    },
+                ),
+                _ => Some(unacked),
+            };
+            if let Some(octets) = octets {
+                self.give_back(u64::from(octets), task);
+            }
         }
 
         self.clear_recv_buffer(stream, task, counts);
+    }
+
+    /// Grows the connection's window by `octets` of the data the client's mirrored streams
+    /// released that the relaying peer, their streams reset, wasn't sent (see
+    /// `Relay::give_back`).
+    pub fn give_back(&mut self, octets: u64, task: &mut Option<Waker>) {
+        let octets = octets.min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
+        if octets == 0 {
+            return;
+        }
+        self.assign_connection_capacity(octets, task);
+        self.mirror_covered -= u64::from(octets);
     }
 
     /// Takes back the window the connection gave itself, as far as not yet announced, for
@@ -933,6 +967,7 @@ impl Recv {
             if !stream.recv_flow.is_mirror() {
                 if unrecorded {
                     stream.unmirrored = stream.unmirrored.saturating_sub(padding);
+                    stream.data_taken = stream.data_taken.saturating_sub(u64::from(padding));
                 } else {
                     stream.unmirrored_padding = stream.unmirrored_padding.saturating_add(padding);
                 }

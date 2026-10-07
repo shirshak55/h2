@@ -271,8 +271,9 @@ where
     }
 
     /// Applies the relay's asks to mirror the client's streams' windows and to grow them by
-    /// padding (see `Relay::mirror_stream_window`, `Relay::release_padding`), ahead of the
-    /// WINDOW_UPDATEs due, so that none goes out for what the relaying peer grants.
+    /// padding (see `Relay::mirror_stream_window`, `Relay::release_padding`), and the
+    /// connection's by the data reset streams gave back (see `Relay::give_back`), ahead of
+    /// the WINDOW_UPDATEs due, so that none goes out for what the relaying peer grants.
     fn apply_relayed_windows(&mut self) {
         let Some(relay) = &self.relay else {
             return;
@@ -284,6 +285,10 @@ where
         }
         for (stream_id, octets) in relay.take_released_padding() {
             self.inner.streams.release_padding(stream_id.into(), octets);
+        }
+        let given_back = relay.take_given_back();
+        if given_back != 0 {
+            self.inner.streams.give_back(given_back);
         }
     }
 

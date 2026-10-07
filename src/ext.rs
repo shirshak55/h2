@@ -508,6 +508,66 @@ pub(crate) struct ReceivedBody {
     /// Whether it dropped a DATA frame it had to keep (see [`BodyFrames::dropped`]).
     dropped: bool,
     trailers: Option<HeaderBlockEncoding>,
+    /// How far it went on to the relaying peer (see [`BodyFrames::relay_sent`]).
+    relayed: Arc<Mutex<RelayedBody>>,
+}
+
+/// How far a body went on to the relaying peer once it went no further, and what its
+/// stream, reset before that was known, gives back to the connection's window then.
+#[derive(Debug, Default)]
+pub(crate) struct RelayedBody {
+    sent: Option<u64>,
+    refund: Option<Refund>,
+}
+
+/// What a client's mirrored stream reset gives back to the connection's window (see
+/// `Recv::release_closed_capacity`): of the data it released, `data_taken`, and the part
+/// released while mirrored, `mirrored_taken`, what the relaying peer wasn't sent, up to
+/// `unacked`, the data that peer's WINDOW_UPDATEs on the stream didn't cover, which it
+/// gives back when how far the body went never comes.
+#[derive(Debug)]
+pub(crate) struct Refund {
+    pub(crate) data_taken: u64,
+    pub(crate) mirrored_taken: u64,
+    pub(crate) unacked: u32,
+    pub(crate) relay: Relay,
+}
+
+impl Refund {
+    /// The octets it gives back, the relaying peer having been sent `sent`.
+    pub(crate) fn octets(&self, sent: u64) -> u32 {
+        self.data_taken
+            .saturating_sub(sent)
+            .min(self.mirrored_taken)
+            .min(u64::from(self.unacked)) as u32
+    }
+}
+
+impl RelayedBody {
+    fn lock(relayed: &Mutex<Self>) -> MutexGuard<'_, Self> {
+        relayed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The octets `refund` gives back now, once how far the body went is known; else it
+    /// gives them back then.
+    pub(crate) fn refund(relayed: &Mutex<Self>, refund: Refund) -> Option<u32> {
+        let mut relayed = Self::lock(relayed);
+        match relayed.sent {
+            Some(sent) => Some(refund.octets(sent)),
+            None => {
+                relayed.refund = Some(refund);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for RelayedBody {
+    fn drop(&mut self) {
+        if let Some(refund) = self.refund.take() {
+            refund.relay.give_back(refund.unacked);
+        }
+    }
 }
 
 /// A DATA frame a [`BodyFrames`] keeps.
@@ -583,6 +643,24 @@ impl BodyFrames {
     /// Takes how the trailers' header block went, once it arrived.
     pub fn take_trailers(&self) -> Option<HeaderBlockEncoding> {
         self.lock().trailers.take()
+    }
+
+    /// Tells that the body, relayed, went no further than `sent` octets of flow-controlled
+    /// data on the stream it was relayed on: the data its own stream released past those,
+    /// which the relaying peer never grants, grows the connection's receive window should
+    /// the client reset that stream, as the data never released does.
+    pub fn relay_sent(&self, sent: u64) {
+        let relayed = self.relayed();
+        let mut relayed = RelayedBody::lock(&relayed);
+        relayed.sent = Some(sent);
+        if let Some(refund) = relayed.refund.take() {
+            refund.relay.give_back(refund.octets(sent));
+        }
+    }
+
+    /// How far it went on to the relaying peer (see [`Self::relay_sent`]).
+    pub(crate) fn relayed(&self) -> Arc<Mutex<RelayedBody>> {
+        Arc::clone(&self.lock().relayed)
     }
 }
 
@@ -974,6 +1052,9 @@ struct RelayInner {
     released_padding: Vec<(u32, u32)>,
     /// The octets of data the relaying peer was sent so far (see [`Relay::set_peer_sent`]).
     peer_sent: u64,
+    /// The data the client's reset streams released that the relaying peer wasn't sent,
+    /// which grows the connection's window here (see [`Relay::give_back`]).
+    given_back: u64,
     /// Whether the connection ended.
     closed: bool,
 }
@@ -1111,6 +1192,23 @@ impl Relay {
     /// The octets of data the relaying peer was sent so far (see [`Self::set_peer_sent`]).
     pub(crate) fn peer_sent(&self) -> u64 {
         self.lock().peer_sent
+    }
+
+    /// Grows the connection's receive window by `octets` of the data a client's stream
+    /// released before it was reset that the relaying peer wasn't sent (see
+    /// [`BodyFrames::relay_sent`]), which its WINDOW_UPDATEs never grow it by.
+    pub(crate) fn give_back(&self, octets: u32) {
+        if octets == 0 {
+            return;
+        }
+        let mut inner = self.lock();
+        inner.given_back += u64::from(octets);
+        inner.wake();
+    }
+
+    /// The data given back since last asked (see [`Self::give_back`]).
+    pub(crate) fn take_given_back(&self) -> u64 {
+        std::mem::take(&mut self.lock().given_back)
     }
 
     /// Whether the client's SETTINGS and PINGs await relayed acknowledgements.

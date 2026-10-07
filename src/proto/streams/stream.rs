@@ -125,6 +125,17 @@ pub(super) struct Stream {
     pub unmirrored: WindowSize,
     pub unmirrored_padding: WindowSize,
 
+    /// The data released but the padding the window grew by here, and the part of it
+    /// released while the window grew only by relayed WINDOW_UPDATEs: what of that part
+    /// the relaying peer wasn't sent (see `ext::BodyFrames::relay_sent`) the connection's
+    /// window grows by here should the stream be reset.
+    pub data_taken: u64,
+    pub mirrored_taken: u64,
+
+    /// How far its request's body went on to the relaying peer (see
+    /// `ext::BodyFrames::relay_sent`)
+    pub relayed_body: Option<std::sync::Arc<std::sync::Mutex<crate::ext::RelayedBody>>>,
+
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -235,6 +246,9 @@ impl Stream {
             relays_padding: false,
             unmirrored: 0,
             unmirrored_padding: 0,
+            data_taken: 0,
+            mirrored_taken: 0,
+            relayed_body: None,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
@@ -261,6 +275,9 @@ impl Stream {
         self.recv_flow.set_mirror();
         if !relays_padding {
             self.unmirrored = self.unmirrored.saturating_sub(self.unmirrored_padding);
+            self.data_taken = self
+                .data_taken
+                .saturating_sub(u64::from(self.unmirrored_padding));
         }
         let sent = self.unmirrored;
         let unannounced = self
@@ -273,6 +290,14 @@ impl Stream {
         debug_assert!(_res.is_ok());
         self.unmirrored -= cancelled;
         sent
+    }
+
+    /// Counts `octets` of data as released (see `Stream::data_taken`).
+    pub fn take_data(&mut self, octets: WindowSize) {
+        self.data_taken += u64::from(octets);
+        if self.recv_flow.is_mirror() {
+            self.mirrored_taken += u64::from(octets);
+        }
     }
 
     /// Increment the stream's ref count

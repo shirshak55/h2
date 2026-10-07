@@ -201,6 +201,14 @@ where
         }
     }
 
+    /// Grows the connection's receive window by `octets` of the data the client's reset
+    /// streams released that the relaying peer wasn't sent (see `Relay::give_back`).
+    pub fn give_back(&mut self, octets: u64) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.recv.give_back(octets, &mut me.actions.task);
+    }
+
     /// Makes stream `id`'s window grow only by relayed WINDOW_UPDATEs (see
     /// `Relay::mirror_stream_window`).
     pub fn mirror_stream_window(&mut self, id: StreamId, relays_padding: bool) {
@@ -2007,6 +2015,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     stream.ref_dec();
 
     let actions = &mut me.actions;
+    let relay = &me.relay;
 
     // If the stream is not referenced and it is already
     // closed (does not have to go through logic below
@@ -2026,7 +2035,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task, counts);
+                .release_closed_capacity(stream, relay.as_ref(), &mut actions.task, counts);
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();
