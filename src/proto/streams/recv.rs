@@ -574,7 +574,9 @@ impl Recv {
 
     /// Grows mirrored `stream`'s window (see `FlowControl::set_mirror`), and the
     /// connection's, by `padding` octets of the padding it received and released that the
-    /// relaying peer isn't sent, whose WINDOW_UPDATEs never grow them by it.
+    /// relaying peer isn't sent, whose WINDOW_UPDATEs never grow them by it, less the window
+    /// each announced ahead for data released before it was mirrored that those were to
+    /// repay (see `Self::give_back` and `Stream::mirror_window`).
     pub fn release_mirrored_padding(
         &mut self,
         padding: WindowSize,
@@ -586,13 +588,13 @@ impl Recv {
             return;
         }
         stream.mirror_unacked -= padding;
-        self.mirror_covered -= u64::from(padding);
         stream.data_taken = stream.data_taken.saturating_sub(u64::from(padding));
         stream.mirrored_taken = stream.mirrored_taken.saturating_sub(u64::from(padding));
+        self.give_back(u64::from(padding), task);
+        let repaid = padding.min(stream.unmirrored);
+        stream.unmirrored -= repaid;
         // TODO: proper error handling
-        let _res = self.flow.assign_capacity(padding);
-        debug_assert!(_res.is_ok());
-        let _res = stream.recv_flow.assign_capacity(padding);
+        let _res = stream.recv_flow.assign_capacity(padding - repaid);
         debug_assert!(_res.is_ok());
         if stream.recv_flow.unclaimed_capacity().is_some() {
             self.pending_window_updates.push(stream);
@@ -653,9 +655,9 @@ impl Recv {
     }
 
     /// Grows the connection's window by `octets` of the data the client's mirrored streams
-    /// released that the relaying peer, their streams reset, wasn't sent (see
-    /// `Relay::give_back`), less the window it announced ahead for such data still to be
-    /// kept back (see `Self::mirror_released`).
+    /// released that the relaying peer, their streams reset (see `Relay::give_back`) or their
+    /// padding not relayed, wasn't sent, less the window it announced ahead for such data
+    /// still to be kept back (see `Self::mirror_released`).
     pub fn give_back(&mut self, octets: u64, task: &mut Option<Waker>) {
         let octets = octets.min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
         if octets == 0 {
