@@ -378,6 +378,7 @@ impl Prioritize {
             }
             tracing::trace!(?frame, "dropping");
         }
+        stream.reset_layout();
         stream.buffered_send_data = 0;
         stream.buffered_send_padding = 0;
         stream.requested_send_capacity = 0;
@@ -728,6 +729,7 @@ impl Prioritize {
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
             tracing::trace!(?frame, "dropping");
         }
+        stream.reset_layout();
         stream.notify_flushed();
 
         stream.buffered_send_data = 0;
@@ -764,6 +766,7 @@ impl Prioritize {
                 }
             }
         }
+        stream.reset_layout();
         let kept = !headers.is_empty();
         for frame in headers {
             stream.pending_send.push_back(buffer, frame);

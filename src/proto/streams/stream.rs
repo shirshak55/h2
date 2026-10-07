@@ -96,6 +96,9 @@ pub(super) struct Stream {
     /// The DATA frames `body_layout` told of that its body didn't reach yet
     pub body_frames: std::collections::VecDeque<crate::ext::DataFrame>,
 
+    /// The flow-controlled octets of the DATA frames that went on it so far
+    pub data_sent: u64,
+
     // ===== Fields related to receiving =====
     /// Next node in the accept linked list
     pub next_pending_accept: Option<store::Key>,
@@ -221,6 +224,7 @@ impl Stream {
             body_layout: None,
             body_chunks: 0,
             body_frames: std::collections::VecDeque::new(),
+            data_sent: 0,
 
             // ===== Fields related to receiving =====
             next_pending_accept: None,
@@ -387,6 +391,7 @@ impl Stream {
         // TODO: proper error handling
         let _res = self.send_flow.send_data(len + padding);
         debug_assert!(_res.is_ok());
+        self.data_sent += u64::from(len + padding);
 
         // Decrement the stream's buffered data counter
         debug_assert!(self.buffered_send_data >= len as usize);
@@ -405,6 +410,14 @@ impl Stream {
 
         if prev_capacity < self.capacity(max_buffer_size) {
             self.notify_capacity();
+        }
+    }
+
+    /// Tells its body's layout, if any, that the rest of its body doesn't go (see
+    /// `ext::BodyLayout::reset`).
+    pub fn reset_layout(&self) {
+        if let Some(layout) = &self.body_layout {
+            layout.reset(self.data_sent);
         }
     }
 

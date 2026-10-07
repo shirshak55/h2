@@ -609,6 +609,10 @@ pub trait BodyLayout: Send + Sync {
     /// of their own, so that the peer's flow control still takes what the other
     /// connection's did.
     fn misplaced(&self) {}
+
+    /// Tells that the stream was reset once `sent` octets of flow-controlled data went on
+    /// it: the rest of the body doesn't go.
+    fn reset(&self, _sent: u64) {}
 }
 
 /// A response extension sending its body as a [`BodyLayout`] says.
