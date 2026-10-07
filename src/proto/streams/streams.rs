@@ -1396,14 +1396,35 @@ fn plan_data(
     let empty = |received: &&DataFrame| {
         received.index == index && received.len == 0 && !received.end_stream
     };
+    // Those carrying padding or nothing go on as empty frames of their own when the body's
+    // chunks didn't match them, so that the peer's flow control still takes what the other
+    // connection's did (see `BodyLayout::misplaced`).
+    let moves = |received: &DataFrame| {
+        received.padding.is_some() || (received.len == 0 && !received.end_stream)
+    };
     pending.extend(layout.take((!end_stream).then_some(index)));
-    pending.retain(|received| received.index >= index);
+    let mut misplaced = false;
     let mut plan = VecDeque::new();
+    pending.retain(|received| {
+        let kept = received.index >= index;
+        if !kept {
+            misplaced = true;
+            if moves(received) {
+                plan.push_back(planned(false, *received));
+            }
+        }
+        kept
+    });
     if len == 0 && !end_stream {
         // A chunk carrying nothing goes as the empty frame it stands for.
         if let Some(received) = pending.front().filter(empty).copied() {
             pending.pop_front();
             plan.push_back(planned(true, received));
+        } else if !plan.is_empty() {
+            plan.push_back(frame::PlannedFrame {
+                data: true,
+                padding: None,
+            });
         }
     } else {
         while let Some(received) = pending.front().filter(empty).copied() {
@@ -1420,14 +1441,17 @@ fn plan_data(
             data: true,
             padding: carrying.and_then(|received| received.padding),
         });
-        if end_stream && len > 0 {
-            plan.extend(
-                pending
-                    .drain(..)
-                    .filter(|received| received.len == 0)
-                    .map(|received| planned(false, received)),
-            );
+        if end_stream {
+            for received in pending.drain(..) {
+                misplaced |= len == 0 || received.len > 0;
+                if moves(&received) || (len > 0 && received.len == 0) {
+                    plan.push_back(planned(false, received));
+                }
+            }
         }
+    }
+    if misplaced {
+        layout.misplaced();
     }
     if plan.iter().all(|frame| frame.padding.is_none()) && plan.len() <= 1 {
         plan.clear();

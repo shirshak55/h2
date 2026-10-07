@@ -603,6 +603,12 @@ pub trait BodyLayout: Send + Sync {
 
     /// Takes how the trailers' header block went, once it arrived.
     fn take_trailers(&self) -> Option<HeaderBlockEncoding>;
+
+    /// Tells that the body's chunks didn't match the DATA frames [`Self::take`] gave, so
+    /// those went laid out otherwise: the ones carrying padding or nothing as empty frames
+    /// of their own, so that the peer's flow control still takes what the other
+    /// connection's did.
+    fn misplaced(&self) {}
 }
 
 /// A response extension sending its body as a [`BodyLayout`] says.
