@@ -1297,24 +1297,21 @@ impl HeaderBlock {
 /// `fields` in `order`, each listed name taking the next value of that name, then the
 /// values `order` doesn't list, in map order.
 fn ordered_fields(fields: &HeaderMap, order: &[HeaderName]) -> Vec<(HeaderName, HeaderValue)> {
-    let mut taken: HashMap<&HeaderName, usize> = HashMap::new();
+    let mut values = HashMap::new();
     let mut out = Vec::with_capacity(fields.len());
     for name in order {
-        let nth = taken.entry(name).or_default();
-        if let Some(value) = fields.get_all(name).iter().nth(*nth) {
+        let listed = values
+            .entry(name)
+            .or_insert_with_key(|name| fields.get_all(*name).iter());
+        if let Some(value) = listed.next() {
             out.push((name.clone(), value.clone()));
-            *nth += 1;
         }
     }
     for name in fields.keys() {
-        let skip = taken.get(name).copied().unwrap_or_default();
-        out.extend(
-            fields
-                .get_all(name)
-                .iter()
-                .skip(skip)
-                .map(|value| (name.clone(), value.clone())),
-        );
+        let rest = values
+            .remove(name)
+            .unwrap_or_else(|| fields.get_all(name).iter());
+        out.extend(rest.map(|value| (name.clone(), value.clone())));
     }
     out
 }
@@ -1639,5 +1636,37 @@ mod test {
                 }
             );
         }
+    }
+
+    #[test]
+    fn ordered_fields_take_listed_values_then_the_rest() {
+        let mut fields = HeaderMap::new();
+        for (name, value) in [
+            ("x", "1"),
+            ("y", "a"),
+            ("x", "2"),
+            ("x", "3"),
+            ("z", "q"),
+            ("y", "b"),
+        ] {
+            fields.append(name, HeaderValue::from_static(value));
+        }
+        let order = ["y", "x", "w", "x", "y", "y"].map(HeaderName::from_static);
+        let fields: Vec<_> = ordered_fields(&fields, &order)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("y", "a"),
+                ("x", "1"),
+                ("x", "2"),
+                ("y", "b"),
+                ("x", "3"),
+                ("z", "q")
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        );
     }
 }
